@@ -404,7 +404,9 @@ fn query_task_xml(name: &str) -> Result<Option<String>, String> {
         let xml = if bytes.starts_with(&[0xff, 0xfe]) || bytes.get(1) == Some(&0) {
             let start = usize::from(bytes.starts_with(&[0xff, 0xfe])) * 2;
             let words = bytes[start..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect::<Vec<_>>();
             String::from_utf16(&words).map_err(|_| "Windows 排程 XML 編碼錯誤。")?

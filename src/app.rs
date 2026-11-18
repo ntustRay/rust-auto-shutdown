@@ -127,7 +127,7 @@ impl ShutdownApp {
         style
             .text_styles
             .insert(egui::TextStyle::Small, FontId::proportional(14.0));
-        style.spacing.item_spacing = egui::vec2(8.0, 12.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(14.0, 10.0);
         style.spacing.interact_size.y = 36.0;
         style.visuals.override_text_color = Some(INK);
@@ -408,21 +408,50 @@ impl ShutdownApp {
         let running = self.timer.is_running();
         ui.add_enabled_ui(!running, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.once_mode, OnceMode::Minutes, "幾分鐘後");
-                ui.selectable_value(&mut self.once_mode, OnceMode::Clock, "指定時刻");
+                if button(
+                    ui,
+                    "幾分鐘後",
+                    self.once_mode == OnceMode::Minutes,
+                    egui::vec2(112.0, 38.0),
+                )
+                .clicked()
+                {
+                    self.once_mode = OnceMode::Minutes;
+                }
+                if button(
+                    ui,
+                    "指定時刻",
+                    self.once_mode == OnceMode::Clock,
+                    egui::vec2(112.0, 38.0),
+                )
+                .clicked()
+                {
+                    self.once_mode = OnceMode::Clock;
+                }
             });
             match self.once_mode {
                 OnceMode::Minutes => {
                     ui.label(text("倒數分鐘", 15.0, MUTED));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.minutes)
-                            .font(FontId::monospace(38.0))
-                            .desired_width(135.0)
-                            .char_limit(5),
-                    );
+                    egui::Frame::new()
+                        .fill(BACKGROUND)
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::symmetric(16, 8))
+                        .stroke(Stroke::new(1.0, LINE))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.minutes)
+                                    .font(FontId::monospace(38.0))
+                                    .desired_width(115.0)
+                                    .frame(false)
+                                    .char_limit(5),
+                            );
+                        });
                     ui.horizontal(|ui| {
+                        let width = (ui.available_width() - 24.0) / 4.0;
                         for value in [15, 30, 60, 120] {
-                            if ui.button(format!("{value} 分")).clicked() {
+                            if button(ui, &format!("{value} 分"), false, egui::vec2(width, 36.0))
+                                .clicked()
+                            {
                                 self.minutes = value.to_string();
                             }
                         }
@@ -730,7 +759,10 @@ impl eframe::App for ShutdownApp {
         }
         if self.last_refresh.elapsed() >= Duration::from_secs(3) {
             if let Ok(Some(record)) = schedule::last_run() {
-                self.last_run = format!("最近紀錄：{}\n{}", record.completed_at, record.message);
+                let time = DateTime::parse_from_rfc3339(&record.completed_at)
+                    .map(|t| t.with_timezone(&Local).format("%m/%d %H:%M").to_string())
+                    .unwrap_or_else(|_| "時間無法辨識".into());
+                self.last_run = format!("最近執行 {time}\n{}", record.message);
             }
             self.last_refresh = Instant::now();
         }

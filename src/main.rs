@@ -46,7 +46,7 @@ fn main() -> eframe::Result {
         "自動關機 · Auto Shutdown",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([960.0, 800.0])
+                .with_inner_size([840.0, 760.0])
                 .with_min_inner_size([840.0, 760.0]),
             renderer: eframe::Renderer::Glow,
             ..Default::default()
