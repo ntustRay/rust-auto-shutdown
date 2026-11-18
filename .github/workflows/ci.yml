@@ -1,0 +1,64 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Check and build Windows app
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run unit tests without registering schedules
+        run: cargo test --locked
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Check command-line output without opening the UI
+        shell: pwsh
+        run: |
+          $executable = (Resolve-Path 'target/release/rust-auto-shutdown.exe').Path
+          $cases = @(
+            @{ Name = 'version'; Argument = '--version'; ExitCode = 0; Pattern = 'rust-auto-shutdown '; Stream = 'stdout' },
+            @{ Name = 'help'; Argument = '--help'; ExitCode = 0; Pattern = 'Usage:'; Stream = 'stdout' },
+            @{ Name = 'unknown'; Argument = '--unknown-option'; ExitCode = 2; Pattern = 'Unknown arguments'; Stream = 'stderr' }
+          )
+          foreach ($case in $cases) {
+            $stdoutPath = Join-Path $env:RUNNER_TEMP ($case.Name + '-stdout.txt')
+            $stderrPath = Join-Path $env:RUNNER_TEMP ($case.Name + '-stderr.txt')
+            $process = Start-Process -FilePath $executable -ArgumentList $case.Argument -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+            if ($process.ExitCode -ne $case.ExitCode) {
+              throw "$($case.Argument) returned $($process.ExitCode), expected $($case.ExitCode)."
+            }
+            $outputPath = if ($case.Stream -eq 'stdout') { $stdoutPath } else { $stderrPath }
+            $outputText = Get-Content -LiteralPath $outputPath -Raw -Encoding UTF8
+            if ($outputText -notmatch [regex]::Escape($case.Pattern)) {
+              throw "$($case.Argument) did not produce the expected output."
+            }
+          }
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-auto-shutdown-windows
+          path: target/release/rust-auto-shutdown.exe
+          if-no-files-found: error
