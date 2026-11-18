@@ -5,6 +5,7 @@ pub mod schedule;
 pub mod shutdown;
 
 pub const MAX_MINUTES: u64 = 7 * 24 * 60;
+pub const REMINDER_LEAD: Duration = Duration::from_secs(5 * 60);
 
 pub fn parse_minutes(input: &str) -> Result<Duration, String> {
     let value = input.trim();
@@ -92,6 +93,29 @@ impl Timer {
             c.duration
                 .saturating_sub(now.saturating_duration_since(c.started))
         })
+    }
+
+    /// 延後目前這次倒數；若已到期但尚未執行，從現在開始給完整延長時間。
+    pub fn extend(&mut self, now: Instant, additional: Duration) -> Result<Duration, String> {
+        if additional.is_zero() {
+            return Err("延長時間必須大於零。".into());
+        }
+        let remaining = self.remaining(now).ok_or("沒有正在執行的倒數。")?;
+        let extended = remaining
+            .checked_add(additional)
+            .filter(|duration| *duration <= Duration::from_secs(MAX_MINUTES * 60))
+            .ok_or("延長後的剩餘時間不得超過 7 天。")?;
+        now.checked_add(extended).ok_or("延長時間超出系統範圍。")?;
+        // 完成所有檢查後才修改，不讓失敗的操作改變原有到期時間或模式。
+        let countdown = self.countdown.as_mut().ok_or("沒有正在執行的倒數。")?;
+        countdown.started = now;
+        countdown.duration = extended;
+        Ok(extended)
+    }
+
+    pub fn should_remind(&self, now: Instant) -> bool {
+        self.remaining(now)
+            .is_some_and(|remaining| remaining <= REMINDER_LEAD)
     }
 
     pub fn cancel(&mut self) -> bool {
@@ -278,5 +302,138 @@ mod tests {
         assert_eq!(timer.remaining(now).unwrap(), Duration::from_secs(10));
         assert_eq!(format_remaining(Duration::from_millis(1)), "00:00:01");
         assert_eq!(format_remaining(Duration::from_secs(3661)), "01:01:01");
+    }
+
+    #[test]
+    fn extending_preserves_mode_and_executes_once_at_the_new_deadline() {
+        let now = Instant::now();
+        let mut timer = Timer::default();
+        timer
+            .start(now, Duration::from_secs(300), Mode::Shutdown)
+            .unwrap();
+        assert_eq!(
+            timer.extend(now + Duration::from_secs(30), Duration::from_secs(600)),
+            Ok(Duration::from_secs(870))
+        );
+        assert!(
+            timer
+                .poll(now + Duration::from_secs(300), || panic!("old deadline"))
+                .is_none()
+        );
+        let mut calls = 0;
+        assert_eq!(
+            timer.poll(now + Duration::from_secs(900), || {
+                calls += 1;
+                Ok(())
+            }),
+            Some(Ok(Mode::Shutdown))
+        );
+        assert_eq!(calls, 1);
+        assert!(
+            timer
+                .poll(now + Duration::from_secs(901), || panic!("duplicate"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_extensions_add_to_the_existing_deadline() {
+        let now = Instant::now();
+        let mut timer = Timer::default();
+        timer
+            .start(now, Duration::from_secs(300), Mode::Shutdown)
+            .unwrap();
+        timer.extend(now, Duration::from_secs(600)).unwrap();
+        assert_eq!(
+            timer.extend(now + Duration::from_secs(100), Duration::from_secs(1800)),
+            Ok(Duration::from_secs(2600))
+        );
+        assert!(
+            timer
+                .poll(now + Duration::from_secs(900), || panic!("first extension"))
+                .is_none()
+        );
+        assert_eq!(
+            timer.poll(now + Duration::from_secs(2700), || Ok(())),
+            Some(Ok(Mode::Shutdown))
+        );
+    }
+
+    #[test]
+    fn extension_at_or_after_expiry_takes_priority_over_poll() {
+        for elapsed in [300, 301, 3600] {
+            let now = Instant::now();
+            let mut timer = Timer::default();
+            timer
+                .start(now, Duration::from_secs(300), Mode::Shutdown)
+                .unwrap();
+            let clicked = now + Duration::from_secs(elapsed);
+            assert_eq!(
+                timer.extend(clicked, Duration::from_secs(600)),
+                Ok(Duration::from_secs(600))
+            );
+            assert!(timer.poll(clicked, || panic!("extended first")).is_none());
+            assert_eq!(
+                timer.poll(clicked + Duration::from_secs(600), || Ok(())),
+                Some(Ok(Mode::Shutdown))
+            );
+        }
+    }
+
+    #[test]
+    fn extending_a_simulation_never_invokes_the_shutdown_executor() {
+        let now = Instant::now();
+        let mut timer = Timer::default();
+        timer
+            .start(now, Duration::from_secs(60), Mode::Simulation)
+            .unwrap();
+        timer.extend(now, Duration::from_secs(600)).unwrap();
+        assert_eq!(
+            timer.poll(now + Duration::from_secs(660), || panic!("real shutdown")),
+            Some(Ok(Mode::Simulation))
+        );
+    }
+
+    #[test]
+    fn invalid_extensions_leave_the_existing_timer_unchanged() {
+        let now = Instant::now();
+        let mut timer = Timer::default();
+        assert!(timer.extend(now, Duration::from_secs(600)).is_err());
+        timer
+            .start(now, Duration::from_secs(60), Mode::Shutdown)
+            .unwrap();
+        for additional in [
+            Duration::ZERO,
+            Duration::MAX,
+            Duration::from_secs(MAX_MINUTES * 60),
+        ] {
+            assert!(timer.extend(now, additional).is_err());
+            assert_eq!(timer.remaining(now), Some(Duration::from_secs(60)));
+        }
+        assert!(timer.cancel());
+        assert!(timer.extend(now, Duration::from_secs(600)).is_err());
+        assert!(!timer.should_remind(now));
+        assert!(
+            timer
+                .poll(now + Duration::from_secs(600), || panic!("cancelled"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reminder_only_appears_during_the_last_five_minutes() {
+        let now = Instant::now();
+        let mut timer = Timer::default();
+        assert!(!timer.should_remind(now));
+        timer
+            .start(now, Duration::from_secs(301), Mode::Simulation)
+            .unwrap();
+        assert!(!timer.should_remind(now));
+        assert!(timer.should_remind(now + Duration::from_secs(1)));
+        timer
+            .extend(now + Duration::from_secs(1), Duration::from_secs(600))
+            .unwrap();
+        assert!(!timer.should_remind(now + Duration::from_secs(1)));
+        assert!(timer.should_remind(now + Duration::from_secs(601)));
     }
 }

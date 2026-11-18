@@ -1,3 +1,4 @@
+use crate::notification::{self, Action, WindowState};
 use chrono::{DateTime, Local};
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
 use rust_auto_shutdown::{
@@ -52,6 +53,9 @@ pub struct ShutdownApp {
     error: bool,
     last_refresh: Instant,
     last_run: String,
+    reminder_window: WindowState,
+    reminder_feedback: String,
+    reminder_terminal: Option<notification::TerminalNotice>,
 }
 
 fn text(value: impl Into<String>, size: f32, color: Color32) -> RichText {
@@ -81,68 +85,94 @@ fn caption(ui: &mut egui::Ui, value: &str) {
     ui.label(text(value, 14.0, MUTED));
 }
 
+pub(crate) fn configure_theme(ctx: &egui::Context) {
+    ctx.set_visuals(egui::Visuals::light());
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        for (name, file) in [
+            ("body", "segoeui.ttf"),
+            ("cjk", "msjh.ttc"),
+            ("digits", "consola.ttf"),
+        ] {
+            if let Ok(data) =
+                std::fs::read(std::path::PathBuf::from(&root).join("Fonts").join(file))
+            {
+                fonts
+                    .font_data
+                    .insert(name.into(), egui::FontData::from_owned(data).into());
+            }
+        }
+        for (family, candidates) in [
+            (FontFamily::Proportional, vec!["body", "cjk"]),
+            (FontFamily::Monospace, vec!["digits", "cjk"]),
+        ] {
+            let names: Vec<_> = candidates
+                .into_iter()
+                .filter(|name| fonts.font_data.contains_key(*name))
+                .map(str::to_owned)
+                .collect();
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .splice(0..0, names);
+        }
+    }
+    ctx.set_fonts(fonts);
+    let mut style = (*ctx.style()).clone();
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, FontId::proportional(16.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, FontId::proportional(16.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, FontId::proportional(14.0));
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(14.0, 10.0);
+    style.spacing.interact_size.y = 36.0;
+    style.visuals.override_text_color = Some(INK);
+    style.visuals.selection.bg_fill = BLUE;
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    style.visuals.widgets.inactive.bg_fill = Color32::WHITE;
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, LINE);
+    style.visuals.widgets.hovered.bg_fill = TINT;
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BLUE);
+    style.visuals.widgets.active.bg_fill = TINT;
+    style.visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, BLUE);
+    ctx.set_style(style);
+}
+
 impl ShutdownApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = &cc.egui_ctx;
-        ctx.set_visuals(egui::Visuals::light());
-        let mut fonts = egui::FontDefinitions::default();
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            for (name, file) in [
-                ("body", "segoeui.ttf"),
-                ("cjk", "msjh.ttc"),
-                ("digits", "consola.ttf"),
-            ] {
-                if let Ok(data) =
-                    std::fs::read(std::path::PathBuf::from(&root).join("Fonts").join(file))
-                {
-                    fonts
-                        .font_data
-                        .insert(name.into(), egui::FontData::from_owned(data).into());
-                }
-            }
-            for (family, candidates) in [
-                (FontFamily::Proportional, vec!["body", "cjk"]),
-                (FontFamily::Monospace, vec!["digits", "cjk"]),
-            ] {
-                let names: Vec<_> = candidates
-                    .into_iter()
-                    .filter(|name| fonts.font_data.contains_key(*name))
-                    .map(str::to_owned)
-                    .collect();
-                fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .splice(0..0, names);
-            }
-        }
-        ctx.set_fonts(fonts);
-        let mut style = (*ctx.style()).clone();
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, FontId::proportional(16.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(16.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Small, FontId::proportional(14.0));
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(14.0, 10.0);
-        style.spacing.interact_size.y = 36.0;
-        style.visuals.override_text_color = Some(INK);
-        style.visuals.selection.bg_fill = BLUE;
-        style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
-        style.visuals.widgets.inactive.bg_fill = Color32::WHITE;
-        style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, LINE);
-        style.visuals.widgets.hovered.bg_fill = TINT;
-        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BLUE);
-        style.visuals.widgets.active.bg_fill = TINT;
-        style.visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, BLUE);
-        ctx.set_style(style);
+        configure_theme(ctx);
         let (saved, notice, error) = match schedule::load() {
             Ok(Some(value)) => match schedule::task_exists() {
-                Ok(true) => (Some(value), "已載入 Windows 每週排程。".into(), false),
+                Ok(true) => {
+                    let update = schedule::needs_reminder_update().and_then(|needed| {
+                        if needed {
+                            schedule::save(&value)?;
+                        }
+                        Ok(needed)
+                    });
+                    match update {
+                        Ok(true) => (
+                            Some(value),
+                            "已更新每週排程，關機前 5 分鐘會顯示通知。".into(),
+                            false,
+                        ),
+                        Ok(false) => (Some(value), "已載入 Windows 每週排程。".into(), false),
+                        Err(error) => (
+                            Some(value),
+                            format!(
+                                "提醒更新失敗，原任務可能仍直接關機。請停用後重新儲存：{error}"
+                            ),
+                            true,
+                        ),
+                    }
+                }
                 Ok(false) => (None, "Windows 排程不存在，請重新儲存啟用。".into(), true),
                 Err(error) => (None, error, true),
             },
@@ -170,6 +200,9 @@ impl ShutdownApp {
             error,
             last_refresh: Instant::now(),
             last_run: String::new(),
+            reminder_window: WindowState::default(),
+            reminder_feedback: String::new(),
+            reminder_terminal: None,
         }
     }
 
@@ -201,7 +234,13 @@ impl ShutdownApp {
         } else {
             Mode::Shutdown
         };
+        if duration < notification::MINIMUM_NOTICE {
+            return Err("請至少預留 30 秒，讓關機通知有足夠的操作時間。".into());
+        }
         self.timer.start(Instant::now(), duration, mode)?;
+        self.reminder_window = WindowState::default();
+        self.reminder_feedback.clear();
+        self.reminder_terminal = None;
         self.target =
             Some(now + chrono::Duration::from_std(duration).map_err(|_| "時間超出範圍。")?);
         self.active_mode = mode;
@@ -382,7 +421,7 @@ impl ShutdownApp {
                 self.pending = Some(Pending::Weekly(self.weekly.clone()));
             }
         }
-        caption(ui, "關閉視窗後，Windows 仍會依排程執行。");
+        caption(ui, "關機前 5 分鐘通知；關閉主視窗後排程仍有效。");
     }
 
     fn simulation_control(ui: &mut egui::Ui, simulation: &mut bool) {
@@ -518,7 +557,7 @@ impl ShutdownApp {
             self.once_simulation
         };
         let preview_target = if weekly {
-            self.weekly.next_occurrence(&Local::now()).ok()
+            self.weekly.next_reminder(&Local::now()).ok()
         } else if running {
             self.target
         } else {
@@ -691,6 +730,80 @@ impl ShutdownApp {
             self.pending = None;
         }
     }
+
+    fn once_reminder(&mut self, ctx: &egui::Context) {
+        if let Some(notice) = &self.reminder_terminal {
+            let close = ctx.show_viewport_immediate(
+                notification::viewport_id(),
+                notification::builder(false),
+                |child, _| notification::draw_terminal(child, notice),
+            );
+            if close {
+                self.reminder_terminal = None;
+            }
+            return;
+        }
+        let Some(remaining) = self.timer.remaining(Instant::now()) else {
+            self.reminder_window = WindowState::default();
+            return;
+        };
+        let attention = self.reminder_window.observe(remaining);
+        if !self.reminder_window.opened {
+            return;
+        }
+        let target = self.target.unwrap_or_else(Local::now);
+        let simulation = self.active_mode == Mode::Simulation;
+        let action = ctx.show_viewport_immediate(
+            notification::viewport_id(),
+            notification::builder(self.reminder_window.urgent),
+            |child, class| {
+                if class == egui::ViewportClass::Embedded {
+                    // 無法提供獨立提醒時取消，避免沒有通知就繼續關機。
+                    return Some(Action::Cancel);
+                }
+                if attention {
+                    notification::request_attention(child);
+                }
+                notification::draw(
+                    child,
+                    remaining,
+                    target,
+                    simulation,
+                    &self.reminder_feedback,
+                )
+            },
+        );
+        self.reminder_window.mark_shown(Instant::now());
+        match action {
+            Some(Action::Cancel) => {
+                self.timer.cancel();
+                self.target = None;
+                self.notice = "已取消本次關機，固定每週排程保持不變。".into();
+                self.error = false;
+            }
+            Some(Action::Extend(extra)) => match self.timer.extend(Instant::now(), extra) {
+                Ok(remaining) => {
+                    let target =
+                        Local::now() + chrono::Duration::from_std(remaining).unwrap_or_default();
+                    self.target = Some(target);
+                    self.reminder_window.observe(remaining);
+                    self.reminder_feedback = format!(
+                        "已延後 {} 分鐘，本次預定 {}。",
+                        extra.as_secs() / 60,
+                        target.format("%H:%M")
+                    );
+                    self.notice.clone_from(&self.reminder_feedback);
+                    self.error = false;
+                    ctx.send_viewport_cmd_to(
+                        notification::viewport_id(),
+                        egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal),
+                    );
+                }
+                Err(error) => self.reminder_feedback = error,
+            },
+            None => {}
+        }
+    }
 }
 
 impl eframe::App for ShutdownApp {
@@ -745,7 +858,20 @@ impl eframe::App for ShutdownApp {
                 });
             });
         self.confirmation(ctx);
-        if let Some(result) = self.timer.poll(Instant::now(), shutdown::execute) {
+        self.once_reminder(ctx);
+        let now = Instant::now();
+        if self.timer.remaining(now) == Some(Duration::ZERO)
+            && !self.reminder_window.can_execute(now)
+        {
+            self.timer.cancel();
+            self.target = None;
+            self.notice = "通知未能及時顯示，已取消本次關機。請重新設定倒數。".into();
+            self.error = true;
+            self.reminder_terminal = Some(notification::TerminalNotice::new(
+                "本次已取消",
+                &self.notice,
+            ));
+        } else if let Some(result) = self.timer.poll(now, shutdown::execute) {
             self.target = None;
             match result {
                 Ok(Mode::Simulation) => {
@@ -756,7 +882,11 @@ impl eframe::App for ShutdownApp {
                     self.notice = "已送出 Windows 關機要求。".into();
                     self.error = false;
                 }
-                Err(e) => self.report(e),
+                Err(e) => {
+                    self.reminder_terminal =
+                        Some(notification::TerminalNotice::new("本次關機失敗", &e));
+                    self.report(e);
+                }
             }
             ctx.request_repaint();
         }

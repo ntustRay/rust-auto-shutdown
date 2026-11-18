@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod notification;
 use eframe::egui;
 use rust_auto_shutdown::schedule;
 
@@ -23,7 +24,13 @@ fn main() -> eframe::Result {
             "--scheduled-dry-run" | "--scheduled-shutdown"
         )
     {
-        let result = schedule::run_scheduled(args[0] == "--scheduled-dry-run");
+        let result = match schedule::prepare_reminder(args[0] == "--scheduled-dry-run") {
+            Ok(Some(session)) => {
+                notification::run_weekly(session).map_err(|error| error.to_string())
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h" | "--version" | "-V") {

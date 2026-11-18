@@ -16,6 +16,8 @@ const XML_DAYS: [&str; 7] = [
     "Saturday",
     "Sunday",
 ];
+#[cfg(any(windows, test))]
+const REMINDER_MARKER: &str = "rust-auto-shutdown-reminder-v2";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeeklySchedule {
@@ -46,6 +48,11 @@ impl WeeklySchedule {
 
     pub fn next_occurrence(&self, now: &DateTime<Local>) -> Result<DateTime<Local>, String> {
         self.next_in_zone(now)
+    }
+
+    /// 新啟用時只排尚未錯過的五分鐘前提醒；回傳其對應的原關機時刻。
+    pub fn next_reminder(&self, now: &DateTime<Local>) -> Result<DateTime<Local>, String> {
+        self.next_in_zone(&(*now + chrono::Duration::minutes(5)))
     }
 
     fn next_in_zone<T: TimeZone>(&self, now: &DateTime<T>) -> Result<DateTime<T>, String> {
@@ -124,13 +131,7 @@ pub fn save(schedule: &WeeklySchedule) -> Result<(), String> {
     let previous_xml = query_task_xml(&name)?;
     let executable = directory.join("app.exe");
     let source = std::env::current_exe().map_err(|error| format!("找不到目前執行檔：{error}"))?;
-    let source_path = source
-        .canonicalize()
-        .map_err(|error| format!("無法讀取目前執行檔路徑：{error}"))?;
-    if Some(source_path) != executable.canonicalize().ok() {
-        std::fs::copy(&source, &executable)
-            .map_err(|error| format!("無法保存排程執行檔：{error}"))?;
-    }
+    update_executable_if_needed(&source, &executable)?;
     let xml = task_xml(schedule, &executable, &current_sid()?, &Local::now())?;
     let xml_path = directory.join("registration.xml");
     write_xml(&xml_path, &xml)?;
@@ -161,6 +162,40 @@ pub fn save(schedule: &WeeklySchedule) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+fn update_executable_if_needed(source: &Path, target: &Path) -> Result<(), String> {
+    let source_path = source
+        .canonicalize()
+        .map_err(|error| format!("無法讀取目前執行檔路徑：{error}"))?;
+    if Some(source_path) == target.canonicalize().ok() || same_file_contents(source, target)? {
+        return Ok(());
+    }
+    std::fs::copy(source, target)
+        .map(|_bytes| ())
+        .map_err(|error| {
+            format!("無法更新排程執行檔：{error}。請先取消或關閉目前通知，再重新保存排程。")
+        })
+}
+
+#[cfg(any(windows, test))]
+fn same_file_contents(source: &Path, target: &Path) -> Result<bool, String> {
+    let source_metadata =
+        std::fs::metadata(source).map_err(|error| format!("無法讀取目前執行檔資訊：{error}"))?;
+    let target_metadata = match std::fs::metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("無法讀取排程執行檔資訊：{error}")),
+    };
+    if source_metadata.len() != target_metadata.len() {
+        return Ok(false);
+    }
+    let source_bytes =
+        std::fs::read(source).map_err(|error| format!("無法比較目前執行檔：{error}"))?;
+    let target_bytes =
+        std::fs::read(target).map_err(|error| format!("無法比較排程執行檔：{error}"))?;
+    Ok(source_bytes == target_bytes)
+}
+
 #[cfg(not(windows))]
 pub fn save(_schedule: &WeeklySchedule) -> Result<(), String> {
     Err("每週排程僅支援 Windows。".into())
@@ -186,6 +221,17 @@ pub fn task_exists() -> Result<bool, String> {
 
 #[cfg(not(windows))]
 pub fn task_exists() -> Result<bool, String> {
+    Ok(false)
+}
+
+/// 舊版任務仍在原時刻觸發，需重新保存以更新五分鐘前提醒。
+#[cfg(windows)]
+pub fn needs_reminder_update() -> Result<bool, String> {
+    Ok(query_task_xml(&task_name()?)?.is_some_and(|xml| !xml.contains(REMINDER_MARKER)))
+}
+
+#[cfg(not(windows))]
+pub fn needs_reminder_update() -> Result<bool, String> {
     Ok(false)
 }
 
@@ -257,63 +303,120 @@ fn write_run_record(path: &Path, record: &RunRecord) -> Result<(), String> {
     result.map_err(|error| format!("無法完整保存執行紀錄，既有紀錄保持不變：{error}"))
 }
 
-/// 此入口只接受已保存且模式相符的排程，不讓命令列選項繞過 UI 確認。
-pub fn run_scheduled(simulation: bool) -> Result<(), String> {
+/// 已領取的單次提醒。延後只更新 `target`，不改 `scheduled_for` 與固定週期。
+pub struct ScheduledReminder {
+    pub target: DateTime<Local>,
+    pub simulation: bool,
+    pub scheduled_for: String,
+    claim_lock: Option<FileLock>,
+    record_path: PathBuf,
+    finished: bool,
+}
+
+impl ScheduledReminder {
+    pub fn finish(&mut self, result: Result<(), String>) -> Result<(), String> {
+        let (success, message) = match result {
+            Ok(()) if self.simulation => (true, "模擬完成，未執行關機。".into()),
+            Ok(()) => (true, "Windows 已接受關機要求。".into()),
+            Err(error) => (false, format!("執行失敗：{error}")),
+        };
+        self.complete(success, message)
+    }
+
+    pub fn cancel(&mut self) -> Result<(), String> {
+        self.complete(true, "已取消這次關機，固定每週排程保持不變。".into())
+    }
+
+    fn complete(&mut self, success: bool, message: String) -> Result<(), String> {
+        if self.finished {
+            return Err("這次提醒已結束，未重複更新。".into());
+        }
+        let record = RunRecord {
+            scheduled_for: self.scheduled_for.clone(),
+            completed_at: Local::now().to_rfc3339(),
+            simulation: self.simulation,
+            success,
+            message,
+        };
+        // 即使最後紀錄失敗，先前的領取紀錄仍阻止同一次週期再次執行。
+        let result = write_run_record(&self.record_path, &record);
+        self.finished = true;
+        self.claim_lock.take();
+        result
+    }
+}
+
+/// 僅準備提醒，絕不直接關機。只接受原通知時刻起 0 至 119 秒內的啟動。
+pub fn prepare_reminder(simulation: bool) -> Result<Option<ScheduledReminder>, String> {
     let schedule = load()?.ok_or("沒有已啟用的每週排程。")?;
     if simulation != schedule.simulation {
         return Err("工作模式與已保存設定不符，拒絕執行。".into());
     }
-    let now = Local::now();
+    claim_reminder(&schedule, &Local::now(), &data_directory()?)
+}
+
+fn reminder_target<T: TimeZone>(
+    schedule: &WeeklySchedule,
+    now: &DateTime<T>,
+) -> Result<Option<DateTime<T>>, String> {
+    schedule.validate()?;
     let time = parse_clock(&schedule.time)?;
-    if !schedule.days[now.weekday().num_days_from_monday() as usize] {
-        return Err("今天不在排程的星期範圍內。".into());
-    }
-    let scheduled = now.date_naive().and_time(time);
-    let delay = now
-        .naive_local()
-        .signed_duration_since(scheduled)
-        .num_seconds();
-    if !(0..120).contains(&delay) {
-        return Err("目前不在排程時刻的兩分鐘執行範圍內，未執行關機。".into());
-    }
-    let directory = data_directory()?;
-    let _lock = FileLock::acquire(directory.join("execution.lock"))?;
-    let scheduled_for = scheduled.format("%Y-%m-%d %H:%M").to_string();
-    if last_run()?.is_some_and(|previous| previous.scheduled_for == scheduled_for) {
-        return Err("這次排程已執行過，未重複執行。".into());
-    }
-    let mut record = RunRecord {
-        scheduled_for,
-        completed_at: now.to_rfc3339(),
-        simulation,
-        success: simulation,
-        message: if simulation {
-            "模擬完成，未執行關機。"
-        } else {
-            "準備送出 Windows 關機要求。"
+    // 提醒可能在關機日期的前一天，最多需檢查今天與明天的關機時刻。
+    for offset in 0..=1 {
+        let date = now
+            .date_naive()
+            .checked_add_days(Days::new(offset))
+            .ok_or("日期超出範圍。")?;
+        if !schedule.days[date.weekday().num_days_from_monday() as usize] {
+            continue;
         }
-        .into(),
+        let target = match now.timezone().from_local_datetime(&date.and_time(time)) {
+            LocalResult::Single(target) => target,
+            _ => return Err("提醒時刻受到時區切換影響，未執行。".into()),
+        };
+        let notify_at = target.clone() - chrono::Duration::minutes(5);
+        let elapsed = now.clone().signed_duration_since(notify_at);
+        if elapsed >= chrono::Duration::zero() && elapsed < chrono::Duration::minutes(2) {
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
+}
+
+fn claim_reminder(
+    schedule: &WeeklySchedule,
+    now: &DateTime<Local>,
+    directory: &Path,
+) -> Result<Option<ScheduledReminder>, String> {
+    let Some(target) = reminder_target(schedule, now)? else {
+        return Ok(None);
     };
-    let path = directory.join("last-run.json");
-    let write_record = |record: &RunRecord| write_run_record(&path, record);
-    write_record(&record)?;
-    if simulation {
-        return Ok(());
+    let lock = FileLock::acquire(directory.join("execution.lock"))?;
+    let scheduled_for = target.format("%Y-%m-%d %H:%M").to_string();
+    let record_path = directory.join("last-run.json");
+    if read_run_record(&record_path)?
+        .is_some_and(|previous| previous.scheduled_for == scheduled_for)
+    {
+        return Ok(None);
     }
-    match crate::shutdown::execute() {
-        Ok(()) => {
-            record.completed_at = Local::now().to_rfc3339();
-            record.success = true;
-            record.message = "Windows 已接受關機要求。".into();
-            write_record(&record)
-        }
-        Err(error) => {
-            record.completed_at = Local::now().to_rfc3339();
-            record.message = format!("執行失敗：{error}");
-            let _ = write_record(&record);
-            Err(error)
-        }
-    }
+    write_run_record(
+        &record_path,
+        &RunRecord {
+            scheduled_for: scheduled_for.clone(),
+            completed_at: now.to_rfc3339(),
+            simulation: schedule.simulation,
+            success: false,
+            message: "已開啟關機前提醒，等待倒數或使用者操作。".into(),
+        },
+    )?;
+    Ok(Some(ScheduledReminder {
+        target,
+        simulation: schedule.simulation,
+        scheduled_for,
+        claim_lock: Some(lock),
+        record_path,
+        finished: false,
+    }))
 }
 
 struct FileLock {
@@ -508,18 +611,34 @@ fn xml_escape(value: &str) -> String {
 }
 
 #[cfg(any(windows, test))]
+fn notification_pattern(schedule: &WeeklySchedule) -> Result<(NaiveTime, [bool; 7]), String> {
+    schedule.validate()?;
+    let time = parse_clock(&schedule.time)?;
+    let (notify_time, overflow) = time.overflowing_sub_signed(chrono::Duration::minutes(5));
+    let days = if overflow != 0 {
+        let mut shifted = [false; 7];
+        for (index, selected) in schedule.days.iter().enumerate() {
+            shifted[(index + 6) % 7] = *selected;
+        }
+        shifted
+    } else {
+        schedule.days
+    };
+    Ok((notify_time, days))
+}
+
+#[cfg(any(windows, test))]
 fn task_xml<T: TimeZone>(
     schedule: &WeeklySchedule,
     executable: &Path,
     sid: &str,
     now: &DateTime<T>,
 ) -> Result<String, String> {
-    schedule.validate()?;
+    let (notify_time, notification_days) = notification_pattern(schedule)?;
     let executable = executable
         .to_str()
         .ok_or("排程執行檔路徑不是有效 Unicode。")?;
-    let selected_days = schedule
-        .days
+    let selected_days = notification_days
         .iter()
         .zip(XML_DAYS)
         .filter(|(selected, _day)| **selected)
@@ -533,14 +652,14 @@ fn task_xml<T: TimeZone>(
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Rust Auto Shutdown weekly schedule for the current user.</Description></RegistrationInfo>
+  <RegistrationInfo><Description>Rust Auto Shutdown weekly schedule for the current user. {REMINDER_MARKER}</Description></RegistrationInfo>
   <Triggers><CalendarTrigger><StartBoundary>{date}T{time}:00</StartBoundary><Enabled>true</Enabled><ScheduleByWeek><WeeksInterval>1</WeeksInterval><DaysOfWeek>{selected_days}</DaysOfWeek></ScheduleByWeek></CalendarTrigger></Triggers>
   <Principals><Principal id="CurrentUser"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><StartWhenAvailable>false</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><AllowStartOnDemand>false</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT5M</ExecutionTimeLimit><Priority>7</Priority></Settings>
+  <Settings><MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><StartWhenAvailable>false</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><AllowStartOnDemand>false</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority></Settings>
   <Actions Context="CurrentUser"><Exec><Command>{executable}</Command><Arguments>{argument}</Arguments></Exec></Actions>
 </Task>"#,
         date = now.date_naive().format("%Y-%m-%d"),
-        time = schedule.time,
+        time = notify_time.format("%H:%M"),
         sid = xml_escape(sid),
         executable = xml_escape(executable),
     ))
@@ -579,8 +698,184 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
             let _ = std::fs::remove_file(self.0.with_extension("pending.json"));
+            let _ = std::fs::remove_file(self.0.with_extension("copy"));
+            let _ = std::fs::remove_file(self.0.parent().unwrap().join("schedule.json"));
             let _ = std::fs::remove_dir(self.0.parent().unwrap());
         }
+    }
+
+    #[test]
+    fn executable_comparison_handles_missing_different_and_identical_files() {
+        let scratch = ScratchRecord::new("binary-comparison");
+        let target = scratch.0.with_extension("copy");
+        std::fs::write(&scratch.0, b"binary-v1").unwrap();
+        assert!(!same_file_contents(&scratch.0, &target).unwrap());
+        std::fs::write(&target, b"a-different-length").unwrap();
+        assert!(!same_file_contents(&scratch.0, &target).unwrap());
+        std::fs::write(&target, b"binary-v2").unwrap();
+        assert!(!same_file_contents(&scratch.0, &target).unwrap());
+        std::fs::write(&target, b"binary-v1").unwrap();
+        assert!(same_file_contents(&scratch.0, &target).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saving_identical_binary_does_not_overwrite_locked_notification_executable() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let scratch = ScratchRecord::new("locked-notification");
+        let target = scratch.0.with_extension("copy");
+        std::fs::write(&scratch.0, b"binary-v1").unwrap();
+        std::fs::write(&target, b"binary-v1").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&target)
+            .unwrap();
+        update_executable_if_needed(&scratch.0, &target).unwrap();
+        std::fs::write(&scratch.0, b"binary-v2").unwrap();
+        let error = update_executable_if_needed(&scratch.0, &target).unwrap_err();
+        assert!(error.contains("請先取消或關閉目前通知"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"binary-v1");
+        drop(locked);
+        update_executable_if_needed(&scratch.0, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"binary-v2");
+    }
+
+    #[test]
+    fn notification_pattern_moves_early_monday_shutdown_to_sunday() {
+        let mut schedule = WeeklySchedule {
+            days: [true, false, true, false, false, false, false],
+            time: "00:02".into(),
+            simulation: true,
+        };
+        let (time, days) = notification_pattern(&schedule).unwrap();
+        assert_eq!(time.format("%H:%M").to_string(), "23:57");
+        assert_eq!(days, [false, true, false, false, false, false, true]);
+        schedule.time = "00:05".into();
+        let (time, days) = notification_pattern(&schedule).unwrap();
+        assert_eq!(time.format("%H:%M").to_string(), "00:00");
+        assert_eq!(days, schedule.days);
+    }
+
+    #[test]
+    fn reminder_window_resolves_week_month_and_year_crossings() {
+        let zone = FixedOffset::east_opt(8 * 3600).unwrap();
+        for (year, month, day, expected, weekday) in [
+            (2026, 11, 22, "2026-11-23 00:02", 0),
+            (2027, 2, 28, "2027-03-01 00:02", 0),
+            (2026, 12, 31, "2027-01-01 00:02", 4),
+        ] {
+            let mut schedule = WeeklySchedule {
+                days: [false; 7],
+                time: "00:02".into(),
+                simulation: true,
+            };
+            schedule.days[weekday] = true;
+            let notification = zone.with_ymd_and_hms(year, month, day, 23, 57, 0).unwrap();
+            let target = reminder_target(&schedule, &notification).unwrap().unwrap();
+            assert_eq!(target.format("%F %R").to_string(), expected);
+            assert!(
+                reminder_target(
+                    &schedule,
+                    &(notification - chrono::Duration::milliseconds(1))
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                reminder_target(
+                    &schedule,
+                    &(notification + chrono::Duration::milliseconds(119_999))
+                )
+                .unwrap()
+                .is_some()
+            );
+            assert!(
+                reminder_target(&schedule, &(notification + chrono::Duration::minutes(2)))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(reminder_target(&schedule, &target).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn cancellation_claims_only_this_occurrence_and_keeps_weekly_config() {
+        let scratch = ScratchRecord::new("cancel-reminder");
+        let directory = scratch.0.parent().unwrap();
+        let schedule = WeeklySchedule {
+            time: "12:00".into(),
+            ..Default::default()
+        };
+        let config = serde_json::to_vec_pretty(&schedule).unwrap();
+        let config_path = directory.join("schedule.json");
+        std::fs::write(&config_path, &config).unwrap();
+        let now = Local.with_ymd_and_hms(2026, 11, 18, 11, 55, 0).unwrap();
+        let mut reminder = claim_reminder(&schedule, &now, directory).unwrap().unwrap();
+        assert!(claim_reminder(&schedule, &now, directory).is_err());
+        reminder.target += chrono::Duration::minutes(30);
+        assert_eq!(reminder.scheduled_for, "2026-11-18 12:00");
+        reminder.cancel().unwrap();
+        assert!(
+            claim_reminder(&schedule, &now, directory)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(config_path).unwrap(), config);
+        let record = read_run_record(&scratch.0).unwrap().unwrap();
+        assert_eq!(record.scheduled_for, "2026-11-18 12:00");
+        assert!(record.message.contains("已取消這次關機"));
+        assert!(reminder.finish(Ok(())).is_err());
+    }
+
+    #[test]
+    fn reminder_finish_records_simulation_and_does_not_reclaim_after_drop() {
+        let scratch = ScratchRecord::new("finish-reminder");
+        let directory = scratch.0.parent().unwrap();
+        let schedule = WeeklySchedule {
+            time: "12:00".into(),
+            ..Default::default()
+        };
+        let now = Local.with_ymd_and_hms(2026, 11, 18, 11, 55, 0).unwrap();
+        let mut reminder = claim_reminder(&schedule, &now, directory).unwrap().unwrap();
+        reminder.target += chrono::Duration::minutes(10);
+        reminder.finish(Ok(())).unwrap();
+        // 錯誤或結果視窗即使仍持有 session，下一次提醒也能取得執行鎖。
+        let released = FileLock::acquire(directory.join("execution.lock")).unwrap();
+        drop(released);
+        let record = read_run_record(&scratch.0).unwrap().unwrap();
+        assert!(record.success && record.simulation);
+        assert_eq!(record.message, "模擬完成，未執行關機。");
+        assert_eq!(record.scheduled_for, "2026-11-18 12:00");
+        drop(reminder);
+        assert!(
+            claim_reminder(&schedule, &now, directory)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn next_reminder_skips_an_already_missed_notification_today() {
+        let schedule = WeeklySchedule::default();
+        let now = Local.with_ymd_and_hms(2026, 11, 18, 23, 27, 0).unwrap();
+        assert_eq!(
+            schedule
+                .next_occurrence(&now)
+                .unwrap()
+                .format("%F %R")
+                .to_string(),
+            "2026-11-18 23:30"
+        );
+        assert_eq!(
+            schedule
+                .next_reminder(&now)
+                .unwrap()
+                .format("%F %R")
+                .to_string(),
+            "2026-11-19 23:30"
+        );
     }
 
     #[test]
@@ -719,6 +1014,10 @@ mod tests {
         assert!(!xml.contains("Password"));
         assert!(xml.contains("<StartWhenAvailable>false</StartWhenAvailable>"));
         assert!(xml.contains("<WakeToRun>false</WakeToRun>"));
+        assert!(xml.contains("T23:25:00</StartBoundary>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains(REMINDER_MARKER));
+        assert!(xml.contains("<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>"));
     }
 
     #[test]
