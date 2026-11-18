@@ -18,16 +18,17 @@ fn console_output() {
 
 fn main() -> eframe::Result {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() == 1
-        && matches!(
-            args[0].as_str(),
-            "--scheduled-dry-run" | "--scheduled-shutdown"
-        )
-    {
-        let result = match schedule::prepare_reminder(args[0] == "--scheduled-dry-run") {
-            Ok(Some(session)) => {
-                notification::run_weekly(session).map_err(|error| error.to_string())
-            }
+    let worker = match args.as_slice() {
+        [mode] => Some((mode.as_str(), None)),
+        [mode, flag, target] if flag == "--remind-now" => {
+            Some((mode.as_str(), Some(target.as_str())))
+        }
+        _ => None,
+    };
+    if let Some((mode @ ("--scheduled-dry-run" | "--scheduled-shutdown"), immediate)) = worker {
+        let result = match schedule::prepare_reminder(mode == "--scheduled-dry-run", immediate) {
+            Ok(Some(session)) => notification::run_weekly(session, immediate.is_some())
+                .map_err(|error| error.to_string()),
             Ok(None) => Ok(()),
             Err(error) => Err(error),
         };

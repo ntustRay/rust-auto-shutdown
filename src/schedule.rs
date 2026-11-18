@@ -50,11 +50,6 @@ impl WeeklySchedule {
         self.next_in_zone(now)
     }
 
-    /// 新啟用時只排尚未錯過的五分鐘前提醒；回傳其對應的原關機時刻。
-    pub fn next_reminder(&self, now: &DateTime<Local>) -> Result<DateTime<Local>, String> {
-        self.next_in_zone(&(*now + chrono::Duration::minutes(5)))
-    }
-
     fn next_in_zone<T: TimeZone>(&self, now: &DateTime<T>) -> Result<DateTime<T>, String> {
         self.validate()?;
         let time = parse_clock(&self.time)?;
@@ -199,6 +194,60 @@ fn same_file_contents(source: &Path, target: &Path) -> Result<bool, String> {
 #[cfg(not(windows))]
 pub fn save(_schedule: &WeeklySchedule) -> Result<(), String> {
     Err("每週排程僅支援 Windows。".into())
+}
+
+#[derive(Debug)]
+pub enum SaveOutcome {
+    Scheduled,
+    ReminderStarted,
+    ReminderFailed(String),
+}
+
+/// 明確儲存時，若下一次已進入提醒時段，由獨立通知程序接手當次。
+pub fn save_from_ui(schedule: &WeeklySchedule) -> Result<SaveOutcome, String> {
+    let occurrence = schedule.next_occurrence(&Local::now())?;
+    save(schedule)?;
+    let now = Local::now();
+    if occurrence.signed_duration_since(now) > reminder_lead() {
+        return Ok(SaveOutcome::Scheduled);
+    }
+    let launch = || -> Result<bool, String> {
+        if !immediate_window(&occurrence, &now) {
+            return Err("儲存時已超過這次的提醒時段。".into());
+        }
+        if last_run()?.is_some_and(|record| record.scheduled_for == occurrence_key(&occurrence)) {
+            return Ok(false);
+        }
+        let mode = if schedule.simulation {
+            "--scheduled-dry-run"
+        } else {
+            "--scheduled-shutdown"
+        };
+        std::process::Command::new(data_directory()?.join("app.exe"))
+            .args([mode, "--remind-now", &occurrence.to_rfc3339()])
+            .spawn()
+            .map_err(|error| format!("無法開啟本次通知：{error}"))?;
+        Ok(true)
+    };
+    Ok(match launch() {
+        Ok(true) => SaveOutcome::ReminderStarted,
+        Ok(false) => SaveOutcome::Scheduled,
+        Err(error) => SaveOutcome::ReminderFailed(error),
+    })
+}
+
+fn reminder_lead() -> chrono::Duration {
+    chrono::Duration::from_std(crate::REMINDER_LEAD).expect("five minutes fit chrono::Duration")
+}
+
+fn immediate_window<T: TimeZone>(occurrence: &DateTime<T>, now: &DateTime<T>) -> bool {
+    // 登錄任務可能剛好跨過整分鐘。只接受這個明確選定的時刻，並限制啟動延遲。
+    let remaining = occurrence.clone().signed_duration_since(now.clone());
+    (-chrono::Duration::seconds(30)..=reminder_lead()).contains(&remaining)
+}
+
+fn occurrence_key<T: TimeZone>(target: &DateTime<T>) -> String {
+    target.naive_local().format("%Y-%m-%d %H:%M").to_string()
 }
 
 pub fn load() -> Result<Option<WeeklySchedule>, String> {
@@ -346,13 +395,39 @@ impl ScheduledReminder {
     }
 }
 
-/// 僅準備提醒，絕不直接關機。只接受原通知時刻起 0 至 119 秒內的啟動。
-pub fn prepare_reminder(simulation: bool) -> Result<Option<ScheduledReminder>, String> {
+/// 一般排程只接受原通知點後兩分鐘內啟動。即時提醒另核對指定週期。
+pub fn prepare_reminder(
+    simulation: bool,
+    immediate: Option<&str>,
+) -> Result<Option<ScheduledReminder>, String> {
+    let now = Local::now();
     let schedule = load()?.ok_or("沒有已啟用的每週排程。")?;
     if simulation != schedule.simulation {
         return Err("工作模式與已保存設定不符，拒絕執行。".into());
     }
-    claim_reminder(&schedule, &Local::now(), &data_directory()?)
+    let directory = data_directory()?;
+    if let Some(value) = immediate {
+        let target = DateTime::parse_from_rfc3339(value)
+            .map_err(|_| "本次提醒時間格式錯誤。")?
+            .with_timezone(&Local);
+        if !matches_immediate_occurrence(&schedule, &target, &now)? {
+            return Ok(None);
+        }
+        claim_occurrence(&schedule, target, &now, &directory)
+    } else {
+        claim_reminder(&schedule, &now, &directory)
+    }
+}
+
+fn matches_immediate_occurrence<T: TimeZone>(
+    schedule: &WeeklySchedule,
+    target: &DateTime<T>,
+    now: &DateTime<T>,
+) -> Result<bool, String> {
+    schedule.validate()?;
+    Ok(immediate_window(target, now)
+        && schedule.days[target.weekday().num_days_from_monday() as usize]
+        && target.time() == parse_clock(&schedule.time)?)
 }
 
 fn reminder_target<T: TimeZone>(
@@ -374,7 +449,7 @@ fn reminder_target<T: TimeZone>(
             LocalResult::Single(target) => target,
             _ => return Err("提醒時刻受到時區切換影響，未執行。".into()),
         };
-        let notify_at = target.clone() - chrono::Duration::minutes(5);
+        let notify_at = target.clone() - reminder_lead();
         let elapsed = now.clone().signed_duration_since(notify_at);
         if elapsed >= chrono::Duration::zero() && elapsed < chrono::Duration::minutes(2) {
             return Ok(Some(target));
@@ -391,8 +466,17 @@ fn claim_reminder(
     let Some(target) = reminder_target(schedule, now)? else {
         return Ok(None);
     };
+    claim_occurrence(schedule, target, now, directory)
+}
+
+fn claim_occurrence(
+    schedule: &WeeklySchedule,
+    target: DateTime<Local>,
+    now: &DateTime<Local>,
+    directory: &Path,
+) -> Result<Option<ScheduledReminder>, String> {
     let lock = FileLock::acquire(directory.join("execution.lock"))?;
-    let scheduled_for = target.format("%Y-%m-%d %H:%M").to_string();
+    let scheduled_for = occurrence_key(&target);
     let record_path = directory.join("last-run.json");
     if read_run_record(&record_path)?
         .is_some_and(|previous| previous.scheduled_for == scheduled_for)
@@ -857,24 +941,35 @@ mod tests {
     }
 
     #[test]
-    fn next_reminder_skips_an_already_missed_notification_today() {
-        let schedule = WeeklySchedule::default();
-        let now = Local.with_ymd_and_hms(2026, 11, 18, 23, 27, 0).unwrap();
-        assert_eq!(
-            schedule
-                .next_occurrence(&now)
-                .unwrap()
-                .format("%F %R")
-                .to_string(),
-            "2026-11-18 23:30"
+    fn saving_seventeen_seconds_before_midnight_due_time_keeps_todays_occurrence() {
+        let schedule = WeeklySchedule {
+            time: "00:04".into(),
+            ..WeeklySchedule::default()
+        };
+        let now = Local.with_ymd_and_hms(2026, 11, 19, 0, 3, 43).unwrap();
+        let target = schedule.next_occurrence(&now).unwrap();
+        assert_eq!(target.format("%F %T").to_string(), "2026-11-19 00:04:00");
+        assert!(reminder_target(&schedule, &now).unwrap().is_none());
+        assert!(matches_immediate_occurrence(&schedule, &target, &now).unwrap());
+        assert!(
+            !matches_immediate_occurrence(
+                &schedule,
+                &target,
+                &(target + chrono::Duration::seconds(31))
+            )
+            .unwrap()
         );
-        assert_eq!(
-            schedule
-                .next_reminder(&now)
+        let scratch = ScratchRecord::new("last-minute-save");
+        let directory = scratch.0.parent().unwrap();
+        let mut reminder = claim_occurrence(&schedule, target, &now, directory)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reminder.scheduled_for, "2026-11-19 00:04");
+        reminder.cancel().unwrap();
+        assert!(
+            claim_occurrence(&schedule, target, &now, directory)
                 .unwrap()
-                .format("%F %R")
-                .to_string(),
-            "2026-11-19 23:30"
+                .is_none()
         );
     }
 

@@ -211,11 +211,21 @@ impl ShutdownApp {
         self.error = true;
     }
     fn save_weekly(&mut self, value: WeeklySchedule) {
-        match schedule::save(&value) {
-            Ok(()) => {
+        match schedule::save_from_ui(&value) {
+            Ok(outcome) => {
                 self.saved = Some(value);
-                self.notice = "已儲存並啟用每週排程，關閉視窗後仍會生效。".into();
                 self.error = false;
+                match outcome {
+                    schedule::SaveOutcome::Scheduled => {
+                        self.notice = "已儲存並啟用每週排程，關閉視窗後仍會生效。".into()
+                    }
+                    schedule::SaveOutcome::ReminderStarted => {
+                        self.notice = "已儲存每週排程，正在開啟本次倒數通知。".into()
+                    }
+                    schedule::SaveOutcome::ReminderFailed(error) => {
+                        self.report(format!("已儲存每週排程，但本次通知未啟動。{error}"))
+                    }
+                }
             }
             Err(error) => self.report(error),
         }
@@ -557,7 +567,7 @@ impl ShutdownApp {
             self.once_simulation
         };
         let preview_target = if weekly {
-            self.weekly.next_reminder(&Local::now()).ok()
+            self.weekly.next_occurrence(&Local::now()).ok()
         } else if running {
             self.target
         } else {
@@ -697,6 +707,13 @@ impl ShutdownApp {
                     Some(Pending::Weekly(value)) => {
                         ui.label(text(value.summary(), 20.0, INK).strong());
                         ui.label("此排程會每週重複，關閉視窗後仍生效。");
+                        if value.next_occurrence(&Local::now()).is_ok_and(|t| {
+                            t.signed_duration_since(Local::now())
+                                .to_std()
+                                .is_ok_and(|d| d <= rust_auto_shutdown::REMINDER_LEAD)
+                        }) {
+                            caption(ui, "本次即將到期，確認後立即通知，至少預留 30 秒操作。");
+                        }
                     }
                     Some(Pending::Once(OnceSchedule::After(d))) => {
                         ui.label(format!("確認後 {} 分鐘執行一次。", d.as_secs() / 60));

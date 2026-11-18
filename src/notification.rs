@@ -244,7 +244,7 @@ pub fn draw(
     action
 }
 
-pub fn run_weekly(session: ScheduledReminder) -> eframe::Result {
+pub fn run_weekly(session: ScheduledReminder, immediate: bool) -> eframe::Result {
     let duration = session
         .target
         .signed_duration_since(Local::now())
@@ -274,6 +274,7 @@ pub fn run_weekly(session: ScheduledReminder) -> eframe::Result {
                 state: WindowState::default(),
                 feedback: String::new(),
                 terminal: None,
+                immediate,
             }))
         }),
     )
@@ -285,6 +286,7 @@ struct WeeklyNotification {
     state: WindowState,
     feedback: String,
     terminal: Option<TerminalNotice>,
+    immediate: bool,
 }
 
 impl eframe::App for WeeklyNotification {
@@ -300,7 +302,33 @@ impl eframe::App for WeeklyNotification {
             return;
         };
         let now = Instant::now();
-        let remaining = self.timer.remaining(now).unwrap_or_default();
+        let mut remaining = self.timer.remaining(now).unwrap_or_default();
+        if std::mem::take(&mut self.immediate) {
+            // 自首幀給足操作時間，另留一秒給實際呈現，不改每週排程。
+            let minimum = MINIMUM_NOTICE + Duration::from_secs(1);
+            if let Some(extra) = minimum.checked_sub(remaining)
+                && !extra.is_zero()
+            {
+                match self.timer.extend(now, extra) {
+                    Ok(adjusted) => {
+                        remaining = adjusted;
+                        session.target = Local::now() + chrono::Duration::seconds(31);
+                        self.feedback = "本次保留至少 30 秒供你延後或取消。".into();
+                    }
+                    Err(error) => {
+                        self.timer.cancel();
+                        let error = match session.cancel() {
+                            Ok(()) => error,
+                            Err(record_error) => format!("{error}\n紀錄也未能保存：{record_error}"),
+                        };
+                        self.session = None;
+                        self.terminal = Some(TerminalNotice::new("本次已取消", error));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            }
+        }
         if self.state.observe(remaining) {
             request_attention(ctx);
         }
