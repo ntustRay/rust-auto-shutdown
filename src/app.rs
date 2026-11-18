@@ -62,7 +62,7 @@ fn card() -> egui::Frame {
         .fill(Color32::WHITE)
         .corner_radius(16)
         .inner_margin(24)
-        .stroke(Stroke::new(1.0, LINE))
+        .stroke(Stroke::new(1.0_f32, LINE))
 }
 fn button(ui: &mut egui::Ui, label: &str, selected: bool, size: Vec2) -> egui::Response {
     ui.add_sized(
@@ -73,7 +73,7 @@ fn button(ui: &mut egui::Ui, label: &str, selected: bool, size: Vec2) -> egui::R
             if selected { Color32::WHITE } else { INK },
         ))
         .fill(if selected { BLUE } else { Color32::WHITE })
-        .stroke(Stroke::new(1.0, if selected { BLUE } else { LINE }))
+        .stroke(Stroke::new(1.0_f32, if selected { BLUE } else { LINE }))
         .corner_radius(8),
     )
 }
@@ -132,13 +132,13 @@ impl ShutdownApp {
         style.spacing.interact_size.y = 36.0;
         style.visuals.override_text_color = Some(INK);
         style.visuals.selection.bg_fill = BLUE;
-        style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+        style.visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
         style.visuals.widgets.inactive.bg_fill = Color32::WHITE;
-        style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
+        style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, LINE);
         style.visuals.widgets.hovered.bg_fill = TINT;
-        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE);
+        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BLUE);
         style.visuals.widgets.active.bg_fill = TINT;
-        style.visuals.widgets.active.bg_stroke = Stroke::new(2.0, BLUE);
+        style.visuals.widgets.active.bg_stroke = Stroke::new(2.0_f32, BLUE);
         ctx.set_style(style);
         let (saved, notice, error) = match schedule::load() {
             Ok(Some(value)) => match schedule::task_exists() {
@@ -227,13 +227,16 @@ impl ShutdownApp {
                     center + egui::vec2(a.sin(), -a.cos()) * 12.0
                 })
                 .collect();
-            p.add(egui::Shape::line(points, Stroke::new(2.5, Color32::WHITE)));
+            p.add(egui::Shape::line(
+                points,
+                Stroke::new(2.5_f32, Color32::WHITE),
+            ));
             p.line_segment(
                 [
                     center + egui::vec2(0.0, -15.0),
                     center + egui::vec2(0.0, -2.0),
                 ],
-                Stroke::new(2.5, Color32::WHITE),
+                Stroke::new(2.5_f32, Color32::WHITE),
             );
             ui.add_space(6.0);
             ui.vertical(|ui| {
@@ -311,7 +314,7 @@ impl ShutdownApp {
                 .fill(BACKGROUND)
                 .corner_radius(10)
                 .inner_margin(egui::Margin::symmetric(16, 8))
-                .stroke(Stroke::new(1.0, LINE))
+                .stroke(Stroke::new(1.0_f32, LINE))
                 .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(value)
@@ -436,7 +439,7 @@ impl ShutdownApp {
                         .fill(BACKGROUND)
                         .corner_radius(10)
                         .inner_margin(egui::Margin::symmetric(16, 8))
-                        .stroke(Stroke::new(1.0, LINE))
+                        .stroke(Stroke::new(1.0_f32, LINE))
                         .show(ui, |ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.minutes)
