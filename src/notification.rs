@@ -470,8 +470,12 @@ impl eframe::App for WeeklyNotification {
         if self.state.observe(remaining) {
             request_attention(ctx);
         }
-        self.state
-            .announce(frame, session.target, session.simulation, &mut self.feedback);
+        self.state.announce(
+            frame,
+            session.target,
+            session.simulation,
+            &mut self.feedback,
+        );
         let action = draw(
             ctx,
             remaining,
@@ -663,7 +667,12 @@ mod tests {
                 .is_none()
         );
         assert!(state.can_execute(now + duration));
-        assert!(timer.poll(now + duration, unexpected_shutdown).unwrap().is_ok());
+        assert!(
+            timer
+                .poll(now + duration, unexpected_shutdown)
+                .unwrap()
+                .is_ok()
+        );
     }
 
     struct PaintedText {
@@ -775,7 +784,8 @@ mod tests {
                         text.clip
                     );
                 }
-                for action in ["最小化", "延後 10 分鐘", "延後 30 分鐘", "取消本次關機"] {
+                for action in ["最小化", "延後 10 分鐘", "延後 30 分鐘", "取消本次關機"]
+                {
                     assert!(
                         texts.iter().any(|text| text.value == action),
                         "missing {action}"
