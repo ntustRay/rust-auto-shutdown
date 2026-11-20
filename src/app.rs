@@ -798,9 +798,8 @@ impl ShutdownApp {
         }
         let target = self.target.unwrap_or_else(Local::now);
         let simulation = self.active_mode == Mode::Simulation;
-        if attention && let Err(error) = self.reminder_window.announce(frame, target, simulation) {
-            self.reminder_feedback = error;
-        }
+        self.reminder_window
+            .announce(frame, target, simulation, &mut self.reminder_feedback);
         let action = ctx.show_viewport_immediate(
             notification::viewport_id(),
             notification::builder(self.reminder_window.urgent),

@@ -12,6 +12,8 @@ const BACKGROUND: Color32 = Color32::from_rgb(242, 245, 250);
 const LINE: Color32 = Color32::from_rgb(220, 227, 238);
 const NAVY: Color32 = Color32::from_rgb(29, 47, 82);
 pub const MINIMUM_NOTICE: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const SYSTEM_NOTICE_ERROR: &str = "Windows 系統通知暫未送出，可在此視窗操作倒數。";
 
 pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("shutdown-notice")
@@ -31,6 +33,8 @@ pub struct WindowState {
     first_shown: Option<Instant>,
     #[cfg(windows)]
     system_notice: Option<windows_notice::Notice>,
+    #[cfg(windows)]
+    next_notice_attempt: Option<Instant>,
 }
 
 impl WindowState {
@@ -50,18 +54,37 @@ impl WindowState {
         _frame: &eframe::Frame,
         _target: DateTime<Local>,
         _simulation: bool,
-    ) -> Result<(), String> {
+        _feedback: &mut String,
+    ) {
         #[cfg(windows)]
         {
-            self.system_notice = Some(windows_notice::Notice::show(_frame, _target, _simulation)?);
+            let now = Instant::now();
+            if !self.urgent
+                || self.system_notice.is_some()
+                || self.next_notice_attempt.is_some_and(|retry| now < retry)
+            {
+                return;
+            }
+            match windows_notice::Notice::show(_frame, _target, _simulation) {
+                Ok(notice) => {
+                    self.system_notice = Some(notice);
+                    if _feedback == SYSTEM_NOTICE_ERROR {
+                        _feedback.clear();
+                    }
+                }
+                Err(()) => {
+                    self.next_notice_attempt = Some(now + Duration::from_secs(2));
+                    SYSTEM_NOTICE_ERROR.clone_into(_feedback);
+                }
+            }
         }
-        Ok(())
     }
 
     pub fn dismiss_system_notice(&mut self) {
         #[cfg(windows)]
         {
             self.system_notice = None;
+            self.next_notice_attempt = None;
         }
     }
 
@@ -81,8 +104,9 @@ mod windows_notice {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::UI::{
         Shell::{
-            NIF_ICON, NIF_INFO, NIF_TIP, NIIF_INFO, NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE,
-            NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+            NIF_ICON, NIF_INFO, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_RESPECT_QUIET_TIME, NIM_ADD,
+            NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+            Shell_NotifyIconW,
         },
         WindowsAndMessaging::{IDI_INFORMATION, LoadIconW},
     };
@@ -94,28 +118,30 @@ mod windows_notice {
             frame: &eframe::Frame,
             target: DateTime<Local>,
             simulation: bool,
-        ) -> Result<Self, String> {
-            let failure = || "Windows 系統通知未送出，可在此視窗操作倒數。".to_owned();
-            let handle = frame.window_handle().map_err(|_| failure())?;
+        ) -> Result<Self, ()> {
+            let handle = frame.window_handle().map_err(|_| ())?;
             let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-                return Err(failure());
+                return Err(());
             };
             // 使用目前視窗的 HWND 與 Windows 共用圖示，不需要額外安裝或註冊應用程式。
             let data = NOTIFYICONDATAW {
                 cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: handle.hwnd.get() as _,
                 uID: 1,
-                uFlags: NIF_ICON | NIF_TIP,
+                uFlags: NIF_ICON | NIF_TIP | NIF_SHOWTIP,
                 hIcon: unsafe { LoadIconW(std::ptr::null_mut(), IDI_INFORMATION) },
                 szTip: wide_text(crate::APP_NAME),
                 ..Default::default()
             };
             if data.hIcon.is_null() || unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
-                return Err(failure());
+                return Err(());
             }
 
             let mut notice = Self(data);
             let data = &mut notice.0;
+            data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+            // 舊版 Shell 若拒絕設定版本，仍可嘗試發送提醒。
+            unsafe { Shell_NotifyIconW(NIM_SETVERSION, data) };
             data.uFlags = NIF_INFO;
             data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
             data.szInfoTitle = wide_text(crate::APP_NAME);
@@ -134,7 +160,7 @@ mod windows_notice {
                 },
             ));
             if unsafe { Shell_NotifyIconW(NIM_MODIFY, data) } == 0 {
-                return Err(failure());
+                return Err(());
             }
             Ok(notice)
         }
@@ -254,16 +280,23 @@ pub fn draw(
         .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(24))
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(10.0, 12.0);
-            ui.label(
-                RichText::new(if simulation {
-                    "關機提醒 · 模擬模式"
-                } else {
-                    "即將自動關機"
-                })
-                .size(25.0)
-                .strong()
-                .color(INK),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if simulation {
+                        "關機提醒 · 模擬模式"
+                    } else {
+                        "即將自動關機"
+                    })
+                    .size(25.0)
+                    .strong()
+                    .color(INK),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(RichText::new("最小化").size(14.0)).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                });
+            });
             ui.label(
                 RichText::new(if simulation {
                     "這次只測試倒數，不會關閉電腦。"
@@ -435,14 +468,10 @@ impl eframe::App for WeeklyNotification {
             }
         }
         if self.state.observe(remaining) {
-            if let Err(error) = self
-                .state
-                .announce(frame, session.target, session.simulation)
-            {
-                self.feedback = error;
-            }
             request_attention(ctx);
         }
+        self.state
+            .announce(frame, session.target, session.simulation, &mut self.feedback);
         let action = draw(
             ctx,
             remaining,
@@ -577,6 +606,66 @@ mod tests {
         assert!(state.can_execute(now + Duration::from_secs(30)));
     }
 
+    #[test]
+    fn minimizing_reminder_preserves_a_ten_minute_simulation() {
+        let now = Instant::now();
+        let duration = Duration::from_secs(600);
+        let mut timer = Timer::default();
+        timer.start(now, duration, Mode::Simulation).unwrap();
+        let mut state = WindowState::default();
+        assert!(!state.observe(timer.remaining(now).unwrap()));
+        let reminder_at = now + REMINDER_LEAD;
+        assert!(state.observe(timer.remaining(reminder_at).unwrap()));
+        state.mark_shown(reminder_at);
+
+        let ctx = egui::Context::default();
+        crate::app::configure_theme(&ctx);
+        let target = Local::now() + chrono::Duration::minutes(5);
+        let render = |ctx: &egui::Context| {
+            assert!(draw(ctx, REMINDER_LEAD, target, true, "").is_none());
+        };
+        let _ = ctx.run(input(1.0, 0, Vec::new()), render);
+        let output = ctx.run(input(1.0, 1, Vec::new()), render);
+        let position = painted_text(&output)
+            .into_iter()
+            .find(|text| text.value == "最小化")
+            .expect("minimize button must be visible")
+            .bounds
+            .center();
+        let mut minimized = false;
+        for (frame, pressed) in [(2, true), (3, false)] {
+            let output = ctx.run(
+                input(
+                    1.0,
+                    frame,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                ),
+                render,
+            );
+            minimized |= output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Minimized(true));
+        }
+        assert!(minimized);
+        assert!(state.urgent);
+        let unexpected_shutdown = || panic!("simulation must never execute a shutdown command");
+        assert!(
+            timer
+                .poll(now + duration - Duration::from_secs(1), unexpected_shutdown)
+                .is_none()
+        );
+        assert!(state.can_execute(now + duration));
+        assert!(timer.poll(now + duration, unexpected_shutdown).unwrap().is_ok());
+    }
+
     struct PaintedText {
         value: String,
         bounds: egui::Rect,
@@ -686,7 +775,7 @@ mod tests {
                         text.clip
                     );
                 }
-                for action in ["延後 10 分鐘", "延後 30 分鐘", "取消本次關機"] {
+                for action in ["最小化", "延後 10 分鐘", "延後 30 分鐘", "取消本次關機"] {
                     assert!(
                         texts.iter().any(|text| text.value == action),
                         "missing {action}"
