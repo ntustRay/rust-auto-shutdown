@@ -9,12 +9,34 @@ permissions:
   contents: read
 
 jobs:
-  windows:
-    name: Check and build Windows app
-    runs-on: windows-latest
+  desktop:
+    name: Check and build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows x64
+            runner: windows-latest
+            artifact: r-auto-shutdown-windows-x64
+          - platform: Linux x64
+            runner: ubuntu-24.04
+            artifact: r-auto-shutdown-linux-x64
+          - platform: macOS Apple silicon
+            runner: macos-15
+            artifact: r-auto-shutdown-macos-arm64
+          - platform: macOS Intel
+            runner: macos-15-intel
+            artifact: r-auto-shutdown-macos-x64
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -36,16 +58,26 @@ jobs:
       - name: Check command-line output without opening the UI
         shell: pwsh
         run: |
-          $executable = (Resolve-Path 'target/release/rust-auto-shutdown.exe').Path
+          $fileName = if ($IsWindows) { 'r-auto-shutdown.exe' } else { 'r-auto-shutdown' }
+          $executable = (Resolve-Path "target/release/$fileName").Path
           $cases = @(
-            @{ Name = 'version'; Argument = '--version'; ExitCode = 0; Pattern = 'rust-auto-shutdown '; Stream = 'stdout' },
+            @{ Name = 'version'; Argument = '--version'; ExitCode = 0; Pattern = 'r-auto-shutdown '; Stream = 'stdout' },
             @{ Name = 'help'; Argument = '--help'; ExitCode = 0; Pattern = 'Usage:'; Stream = 'stdout' },
             @{ Name = 'unknown'; Argument = '--unknown-option'; ExitCode = 2; Pattern = 'Unknown arguments'; Stream = 'stderr' }
           )
           foreach ($case in $cases) {
             $stdoutPath = Join-Path $env:RUNNER_TEMP ($case.Name + '-stdout.txt')
             $stderrPath = Join-Path $env:RUNNER_TEMP ($case.Name + '-stderr.txt')
-            $process = Start-Process -FilePath $executable -ArgumentList $case.Argument -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+            $startOptions = @{
+              FilePath = $executable
+              ArgumentList = $case.Argument
+              Wait = $true
+              PassThru = $true
+              RedirectStandardOutput = $stdoutPath
+              RedirectStandardError = $stderrPath
+            }
+            if ($IsWindows) { $startOptions.WindowStyle = 'Hidden' }
+            $process = Start-Process @startOptions
             if ($process.ExitCode -ne $case.ExitCode) {
               throw "$($case.Argument) returned $($process.ExitCode), expected $($case.ExitCode)."
             }
@@ -57,8 +89,23 @@ jobs:
           }
 
       - name: Upload Windows executable
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: rust-auto-shutdown-windows
-          path: target/release/rust-auto-shutdown.exe
+          name: ${{ matrix.artifact }}
+          path: target/release/r-auto-shutdown.exe
+          if-no-files-found: error
+
+      - name: Package Unix executable with execute permission
+        if: runner.os != 'Windows'
+        env:
+          ARTIFACT_NAME: ${{ matrix.artifact }}
+        run: tar -czf "target/$ARTIFACT_NAME.tar.gz" -C target/release r-auto-shutdown
+
+      - name: Upload Unix archive
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.artifact }}.tar.gz
           if-no-files-found: error

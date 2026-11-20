@@ -2228,6 +2228,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "r-auto-shutdown"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "eframe",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2277,17 +2289,6 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
-
-[[package]]
-name = "rust-auto-shutdown"
-version = "0.2.1"
-dependencies = [
- "chrono",
- "eframe",
- "serde",
- "serde_json",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "rustc-hash"

@@ -17,7 +17,8 @@ const XML_DAYS: [&str; 7] = [
     "Sunday",
 ];
 #[cfg(any(windows, test))]
-const REMINDER_MARKER: &str = "rust-auto-shutdown-reminder-v2";
+// 保留 v2 識別字，避免開過舊版視窗時把新版背景程式換回去。
+const REMINDER_MARKER: &str = "rust-auto-shutdown-reminder-v2; windows-notifications-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeeklySchedule {
@@ -273,7 +274,7 @@ pub fn task_exists() -> Result<bool, String> {
     Ok(false)
 }
 
-/// 舊版任務仍在原時刻觸發，需重新保存以更新五分鐘前提醒。
+/// 更新舊版任務的提醒方式及背景執行檔。
 #[cfg(windows)]
 pub fn needs_reminder_update() -> Result<bool, String> {
     Ok(query_task_xml(&task_name()?)?.is_some_and(|xml| !xml.contains(REMINDER_MARKER)))
@@ -736,7 +737,7 @@ fn task_xml<T: TimeZone>(
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Rust Auto Shutdown weekly schedule for the current user. {REMINDER_MARKER}</Description></RegistrationInfo>
+  <RegistrationInfo><Description>R Auto Shutdown weekly schedule for the current user. {REMINDER_MARKER}</Description></RegistrationInfo>
   <Triggers><CalendarTrigger><StartBoundary>{date}T{time}:00</StartBoundary><Enabled>true</Enabled><ScheduleByWeek><WeeksInterval>1</WeeksInterval><DaysOfWeek>{selected_days}</DaysOfWeek></ScheduleByWeek></CalendarTrigger></Triggers>
   <Principals><Principal id="CurrentUser"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings><MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>false</AllowHardTerminate><StartWhenAvailable>false</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><AllowStartOnDemand>false</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority></Settings>

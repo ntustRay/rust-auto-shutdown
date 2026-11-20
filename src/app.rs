@@ -6,6 +6,7 @@ use rust_auto_shutdown::{
     schedule::{self, WeeklySchedule},
     shutdown,
 };
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const BACKGROUND: Color32 = Color32::from_rgb(242, 245, 250);
@@ -17,6 +18,7 @@ const TINT: Color32 = Color32::from_rgb(234, 240, 255);
 const NAVY: Color32 = Color32::from_rgb(29, 47, 82);
 const RED: Color32 = Color32::from_rgb(177, 48, 65);
 const GREEN: Color32 = Color32::from_rgb(34, 118, 89);
+const WEEKLY_SUPPORTED: bool = cfg!(windows);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -88,35 +90,28 @@ fn caption(ui: &mut egui::Ui, value: &str) {
 pub(crate) fn configure_theme(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::light());
     let mut fonts = egui::FontDefinitions::default();
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        for (name, file) in [
-            ("body", "segoeui.ttf"),
-            ("cjk", "msjh.ttc"),
-            ("digits", "consola.ttf"),
-        ] {
-            if let Ok(data) =
-                std::fs::read(std::path::PathBuf::from(&root).join("Fonts").join(file))
-            {
-                fonts
-                    .font_data
-                    .insert(name.into(), egui::FontData::from_owned(data).into());
-            }
-        }
-        for (family, candidates) in [
-            (FontFamily::Proportional, vec!["body", "cjk"]),
-            (FontFamily::Monospace, vec!["digits", "cjk"]),
-        ] {
-            let names: Vec<_> = candidates
-                .into_iter()
-                .filter(|name| fonts.font_data.contains_key(*name))
-                .map(str::to_owned)
-                .collect();
+    for (name, path) in platform_fonts() {
+        if !fonts.font_data.contains_key(name)
+            && let Ok(data) = std::fs::read(path)
+        {
             fonts
-                .families
-                .entry(family)
-                .or_default()
-                .splice(0..0, names);
+                .font_data
+                .insert(name.into(), egui::FontData::from_owned(data).into());
         }
+    }
+    for (family, candidates) in [
+        (FontFamily::Proportional, ["body", "cjk"]),
+        (FontFamily::Monospace, ["digits", "cjk"]),
+    ] {
+        let names = candidates
+            .into_iter()
+            .filter(|name| fonts.font_data.contains_key(*name))
+            .map(str::to_owned);
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .splice(0..0, names);
     }
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style()).clone();
@@ -144,11 +139,82 @@ pub(crate) fn configure_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+#[cfg(not(target_os = "macos"))]
+fn platform_fonts() -> Vec<(&'static str, PathBuf)> {
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let directory = PathBuf::from(root).join("Fonts");
+        return [
+            ("body", "segoeui.ttf"),
+            ("cjk", "msjh.ttc"),
+            ("digits", "consola.ttf"),
+        ]
+        .map(|(name, file)| (name, directory.join(file)))
+        .to_vec();
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Ok(result) = std::process::Command::new("fc-match")
+        .args(["--format", "%{file}", ":lang=zh-tw"])
+        .output()
+        && result.status.success()
+        && let Ok(path) = String::from_utf8(result.stdout)
+        && !path.is_empty()
+    {
+        return vec![("cjk", PathBuf::from(path))];
+    }
+
+    Vec::new()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_fonts() -> Vec<(&'static str, PathBuf)> {
+    [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+    ]
+    .map(|path| ("cjk", PathBuf::from(path)))
+    .to_vec()
+}
+
 impl ShutdownApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = &cc.egui_ctx;
         configure_theme(ctx);
-        let (saved, notice, error) = match schedule::load() {
+        let (saved, notice, error) = if WEEKLY_SUPPORTED {
+            Self::load_weekly_status()
+        } else {
+            (None, "先用模擬模式確認時間，再啟用真正關機。".into(), false)
+        };
+        let weekly = saved.clone().unwrap_or_default();
+        Self {
+            page: if WEEKLY_SUPPORTED {
+                Page::Weekly
+            } else {
+                Page::Once
+            },
+            once_mode: OnceMode::Minutes,
+            minutes: "30".into(),
+            once_clock: "23:30".into(),
+            once_simulation: true,
+            timer: Timer::default(),
+            active_mode: Mode::Simulation,
+            target: None,
+            weekly,
+            saved,
+            pending: None,
+            notice,
+            error,
+            last_refresh: Instant::now(),
+            last_run: String::new(),
+            reminder_window: WindowState::default(),
+            reminder_feedback: String::new(),
+            reminder_terminal: None,
+        }
+    }
+
+    fn load_weekly_status() -> (Option<WeeklySchedule>, String, bool) {
+        match schedule::load() {
             Ok(Some(value)) => match schedule::task_exists() {
                 Ok(true) => {
                     let update = schedule::needs_reminder_update().and_then(|needed| {
@@ -167,7 +233,7 @@ impl ShutdownApp {
                         Err(error) => (
                             Some(value),
                             format!(
-                                "提醒更新失敗，原任務可能仍直接關機。請停用後重新儲存：{error}"
+                                "提醒更新失敗，原排程可能仍使用舊版程式。請先關閉正在執行的倒數視窗，再重新儲存：{error}"
                             ),
                             true,
                         ),
@@ -178,31 +244,6 @@ impl ShutdownApp {
             },
             Ok(None) => (None, "先用模擬模式確認時間，再啟用真正關機。".into(), false),
             Err(error) => (None, error, true),
-        };
-        let weekly = saved.clone().unwrap_or(WeeklySchedule {
-            days: [true; 7],
-            time: "23:30".into(),
-            simulation: true,
-        });
-        Self {
-            page: Page::Weekly,
-            once_mode: OnceMode::Minutes,
-            minutes: "30".into(),
-            once_clock: "23:30".into(),
-            once_simulation: true,
-            timer: Timer::default(),
-            active_mode: Mode::Simulation,
-            target: None,
-            weekly,
-            saved,
-            pending: None,
-            notice,
-            error,
-            last_refresh: Instant::now(),
-            last_run: String::new(),
-            reminder_window: WindowState::default(),
-            reminder_feedback: String::new(),
-            reminder_terminal: None,
         }
     }
 
@@ -289,37 +330,24 @@ impl ShutdownApp {
             );
             ui.add_space(6.0);
             ui.vertical(|ui| {
-                ui.label(text("自動關機", 25.0, INK).strong());
-                caption(ui, "Auto Shutdown");
+                ui.label(text(crate::APP_NAME, 25.0, INK).strong());
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(text(format!("v{}", env!("CARGO_PKG_VERSION")), 13.0, MUTED));
             });
         });
         ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if button(
-                ui,
-                "每週排程",
-                self.page == Page::Weekly,
-                egui::vec2(132.0, 42.0),
-            )
-            .clicked()
-            {
-                self.page = Page::Weekly;
-            }
-            if button(
-                ui,
-                "單次倒數",
-                self.page == Page::Once,
-                egui::vec2(132.0, 42.0),
-            )
-            .clicked()
-            {
-                self.page = Page::Once;
-            }
-        });
-        ui.add_space(10.0);
+        if WEEKLY_SUPPORTED {
+            ui.horizontal(|ui| {
+                for (page, label) in [(Page::Weekly, "每週排程"), (Page::Once, "單次倒數")]
+                {
+                    if button(ui, label, self.page == page, egui::vec2(132.0, 42.0)).clicked() {
+                        self.page = page;
+                    }
+                }
+            });
+            ui.add_space(10.0);
+        }
         if self.timer.is_running() {
             egui::Frame::new()
                 .fill(TINT)
@@ -446,7 +474,7 @@ impl ShutdownApp {
                     if *simulation {
                         "只記錄結果，不會關閉電腦。"
                     } else {
-                        "到期會要求 Windows 關機，請先儲存工作。"
+                        "到期會向作業系統要求關機，請先儲存工作。"
                     },
                     14.0,
                     if *simulation { MUTED } else { RED },
@@ -748,7 +776,7 @@ impl ShutdownApp {
         }
     }
 
-    fn once_reminder(&mut self, ctx: &egui::Context) {
+    fn once_reminder(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if let Some(notice) = &self.reminder_terminal {
             let close = ctx.show_viewport_immediate(
                 notification::viewport_id(),
@@ -770,6 +798,9 @@ impl ShutdownApp {
         }
         let target = self.target.unwrap_or_else(Local::now);
         let simulation = self.active_mode == Mode::Simulation;
+        if attention && let Err(error) = self.reminder_window.announce(frame, target, simulation) {
+            self.reminder_feedback = error;
+        }
         let action = ctx.show_viewport_immediate(
             notification::viewport_id(),
             notification::builder(self.reminder_window.urgent),
@@ -795,7 +826,8 @@ impl ShutdownApp {
             Some(Action::Cancel) => {
                 self.timer.cancel();
                 self.target = None;
-                self.notice = "已取消本次關機，固定每週排程保持不變。".into();
+                self.reminder_window.dismiss_system_notice();
+                self.notice = "已取消本次倒數。".into();
                 self.error = false;
             }
             Some(Action::Extend(extra)) => match self.timer.extend(Instant::now(), extra) {
@@ -824,9 +856,10 @@ impl ShutdownApp {
 }
 
 impl eframe::App for ShutdownApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
             self.timer.cancel();
+            self.reminder_window.dismiss_system_notice();
             return;
         }
         egui::CentralPanel::default()
@@ -868,20 +901,23 @@ impl eframe::App for ShutdownApp {
                         14.0,
                         if self.error { RED } else { MUTED },
                     ));
-                    caption(
-                        ui,
-                        "每週排程需登入 Windows 且電腦保持喚醒；睡眠期間不會喚醒電腦。",
-                    );
+                    if WEEKLY_SUPPORTED && self.page == Page::Weekly {
+                        caption(
+                            ui,
+                            "每週排程需登入 Windows 且電腦保持喚醒；睡眠期間不會喚醒電腦。",
+                        );
+                    }
                 });
             });
         self.confirmation(ctx);
-        self.once_reminder(ctx);
+        self.once_reminder(ctx, frame);
         let now = Instant::now();
         if self.timer.remaining(now) == Some(Duration::ZERO)
             && !self.reminder_window.can_execute(now)
         {
             self.timer.cancel();
             self.target = None;
+            self.reminder_window.dismiss_system_notice();
             self.notice = "通知未能及時顯示，已取消本次關機。請重新設定倒數。".into();
             self.error = true;
             self.reminder_terminal = Some(notification::TerminalNotice::new(
@@ -890,13 +926,14 @@ impl eframe::App for ShutdownApp {
             ));
         } else if let Some(result) = self.timer.poll(now, shutdown::execute) {
             self.target = None;
+            self.reminder_window.dismiss_system_notice();
             match result {
                 Ok(Mode::Simulation) => {
                     self.notice = "模擬完成：倒數已到期，沒有執行關機。".into();
                     self.error = false;
                 }
                 Ok(Mode::Shutdown) => {
-                    self.notice = "已送出 Windows 關機要求。".into();
+                    self.notice = "已送出關機要求。".into();
                     self.error = false;
                 }
                 Err(e) => {
@@ -907,7 +944,7 @@ impl eframe::App for ShutdownApp {
             }
             ctx.request_repaint();
         }
-        if self.last_refresh.elapsed() >= Duration::from_secs(3) {
+        if WEEKLY_SUPPORTED && self.last_refresh.elapsed() >= Duration::from_secs(3) {
             if let Ok(Some(record)) = schedule::last_run() {
                 let time = DateTime::parse_from_rfc3339(&record.completed_at)
                     .map(|t| t.with_timezone(&Local).format("%m/%d %H:%M").to_string())

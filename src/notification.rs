@@ -29,6 +29,8 @@ pub struct WindowState {
     pub opened: bool,
     pub urgent: bool,
     first_shown: Option<Instant>,
+    #[cfg(windows)]
+    system_notice: Option<windows_notice::Notice>,
 }
 
 impl WindowState {
@@ -37,7 +39,30 @@ impl WindowState {
         let entered = urgent && !self.urgent;
         self.opened |= urgent;
         self.urgent = urgent;
+        if !urgent {
+            self.dismiss_system_notice();
+        }
         entered
+    }
+
+    pub fn announce(
+        &mut self,
+        _frame: &eframe::Frame,
+        _target: DateTime<Local>,
+        _simulation: bool,
+    ) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            self.system_notice = Some(windows_notice::Notice::show(_frame, _target, _simulation)?);
+        }
+        Ok(())
+    }
+
+    pub fn dismiss_system_notice(&mut self) {
+        #[cfg(windows)]
+        {
+            self.system_notice = None;
+        }
     }
 
     pub fn mark_shown(&mut self, now: Instant) {
@@ -47,6 +72,86 @@ impl WindowState {
     pub fn can_execute(&self, now: Instant) -> bool {
         self.first_shown
             .is_some_and(|shown| now.saturating_duration_since(shown) >= MINIMUM_NOTICE)
+    }
+}
+
+#[cfg(windows)]
+mod windows_notice {
+    use chrono::{DateTime, Local};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::{
+        Shell::{
+            NIF_ICON, NIF_INFO, NIF_TIP, NIIF_INFO, NIIF_RESPECT_QUIET_TIME, NIM_ADD, NIM_DELETE,
+            NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+        },
+        WindowsAndMessaging::{IDI_INFORMATION, LoadIconW},
+    };
+
+    pub struct Notice(NOTIFYICONDATAW);
+
+    impl Notice {
+        pub fn show(
+            frame: &eframe::Frame,
+            target: DateTime<Local>,
+            simulation: bool,
+        ) -> Result<Self, String> {
+            let failure = || "Windows 系統通知未送出，可在此視窗操作倒數。".to_owned();
+            let handle = frame.window_handle().map_err(|_| failure())?;
+            let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                return Err(failure());
+            };
+            // 使用目前視窗的 HWND 與 Windows 共用圖示，不需要額外安裝或註冊應用程式。
+            let data = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: handle.hwnd.get() as _,
+                uID: 1,
+                uFlags: NIF_ICON | NIF_TIP,
+                hIcon: unsafe { LoadIconW(std::ptr::null_mut(), IDI_INFORMATION) },
+                szTip: wide_text(crate::APP_NAME),
+                ..Default::default()
+            };
+            if data.hIcon.is_null() || unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
+                return Err(failure());
+            }
+
+            let mut notice = Self(data);
+            let data = &mut notice.0;
+            data.uFlags = NIF_INFO;
+            data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+            data.szInfoTitle = wide_text(crate::APP_NAME);
+            data.szInfo = wide_text(&format!(
+                "{} {}。{}",
+                target.format("%H:%M:%S"),
+                if simulation {
+                    "模擬關機"
+                } else {
+                    "將自動關機"
+                },
+                if simulation {
+                    "可在倒數視窗延後或取消。"
+                } else {
+                    "請儲存工作，或在倒數視窗延後與取消。"
+                },
+            ));
+            if unsafe { Shell_NotifyIconW(NIM_MODIFY, data) } == 0 {
+                return Err(failure());
+            }
+            Ok(notice)
+        }
+    }
+
+    impl Drop for Notice {
+        fn drop(&mut self) {
+            unsafe { Shell_NotifyIconW(NIM_DELETE, &self.0) };
+        }
+    }
+
+    fn wide_text<const N: usize>(value: &str) -> [u16; N] {
+        let mut buffer = [0; N];
+        for (slot, unit) in buffer[..N - 1].iter_mut().zip(value.encode_utf16()) {
+            *slot = unit;
+        }
+        buffer
     }
 }
 
@@ -86,7 +191,7 @@ pub fn draw_terminal(ctx: &egui::Context, notice: &TerminalNotice) -> bool {
                     });
                 ui.add_space(12.0);
                 ui.label(
-                    RichText::new("此視窗不會重試關機。固定每週排程保持不變。")
+                    RichText::new("此視窗不會重試關機。")
                         .size(14.0)
                         .color(MUTED),
                 );
@@ -110,12 +215,12 @@ pub fn draw_terminal(ctx: &egui::Context, notice: &TerminalNotice) -> bool {
 
 pub fn builder(urgent: bool) -> egui::ViewportBuilder {
     egui::ViewportBuilder::default()
-        .with_title("關機倒數通知")
+        .with_title(format!("{} · 關機倒數", crate::APP_NAME))
         .with_inner_size([560.0, 530.0])
         .with_min_inner_size([560.0, 530.0])
         .with_resizable(false)
-        .with_minimize_button(false)
-        .with_active(urgent)
+        .with_minimize_button(true)
+        .with_active(false)
         .with_window_level(if urgent {
             egui::WindowLevel::AlwaysOnTop
         } else {
@@ -231,7 +336,7 @@ pub fn draw(
             }
             ui.label(
                 RichText::new(
-                    "延後會累加到目前預定時間，固定每週排程不變。\n關閉此通知視窗，也會取消本次。",
+                    "延後會累加到目前預定時間。\n最小化後會繼續倒數，關閉視窗會取消本次。",
                 )
                 .size(14.0)
                 .color(MUTED),
@@ -260,9 +365,9 @@ pub fn run_weekly(session: ScheduledReminder, immediate: bool) -> eframe::Result
         .start(Instant::now(), duration.max(Duration::from_millis(1)), mode)
         .map_err(|error| eframe::Error::AppCreation(error.into()))?;
     eframe::run_native(
-        "關機倒數通知",
+        crate::APP_NAME,
         eframe::NativeOptions {
-            viewport: builder(true),
+            viewport: builder(true).with_active(true),
             renderer: eframe::Renderer::Glow,
             ..Default::default()
         },
@@ -290,7 +395,7 @@ struct WeeklyNotification {
 }
 
 impl eframe::App for WeeklyNotification {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(notice) = &self.terminal {
             if draw_terminal(ctx, notice) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -330,6 +435,12 @@ impl eframe::App for WeeklyNotification {
             }
         }
         if self.state.observe(remaining) {
+            if let Err(error) = self
+                .state
+                .announce(frame, session.target, session.simulation)
+            {
+                self.feedback = error;
+            }
             request_attention(ctx);
         }
         let action = draw(
@@ -343,6 +454,7 @@ impl eframe::App for WeeklyNotification {
         match action {
             Some(Action::Cancel) => {
                 self.timer.cancel();
+                self.state.dismiss_system_notice();
                 let result = session.cancel();
                 self.session = None;
                 match result {
@@ -380,6 +492,7 @@ impl eframe::App for WeeklyNotification {
             && !self.state.can_execute(Instant::now())
         {
             self.timer.cancel();
+            self.state.dismiss_system_notice();
             let result = session.cancel();
             self.session = None;
             let message = match result {
@@ -395,6 +508,7 @@ impl eframe::App for WeeklyNotification {
             return;
         }
         if let Some(result) = self.timer.poll(Instant::now(), shutdown::execute) {
+            self.state.dismiss_system_notice();
             let execution = result.map(|_| ());
             let recorded = session.finish(execution.clone());
             let title = if execution.is_err() {
@@ -427,6 +541,17 @@ impl eframe::App for WeeklyNotification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reminder_can_be_minimized_at_both_window_levels() {
+        let urgent = builder(true);
+        let deferred = builder(false);
+        assert_eq!(urgent.minimize_button, Some(true));
+        assert_eq!(deferred.minimize_button, Some(true));
+        assert_eq!(urgent.window_level, Some(egui::WindowLevel::AlwaysOnTop));
+        assert_eq!(deferred.window_level, Some(egui::WindowLevel::Normal));
+        assert_eq!(urgent.active, deferred.active);
+    }
 
     #[test]
     fn reminder_reappears_after_each_extension_without_early_attention() {

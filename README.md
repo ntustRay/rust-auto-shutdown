@@ -1,15 +1,15 @@
-# Rust Auto Shutdown
+# R Auto Shutdown
 
-以 Rust 製作的 Windows 自動關機工具，提供繁體中文視窗、每週重複排程、單次倒數，以及關機前五分鐘通知。首次使用預設為模擬模式；啟用真正關機前需要再次確認。
+繁體中文桌面關機計時器，支援 Windows、macOS 和 Linux。可設定單次倒數，Windows 另支援每週背景排程與系統通知。首次使用預設為模擬模式，啟用真正關機前需確認。
 
-A small Windows desktop shutdown timer with weekly schedules, advance reminders, and simulation mode.
+A desktop shutdown timer for Windows, macOS, and Linux, with advance reminders, simulation mode, and Windows weekly scheduling.
 
 ## 功能
 
-| 模式 | 設定方式 | 關閉視窗後 |
-| --- | --- | --- |
-| 每週排程 | 多選星期與 `HH:MM`，可快速選取每天或平日 | Windows 仍會啟動獨立通知，倒數到期後執行 |
-| 單次倒數 | 1–10,080 分鐘，或下一個本機 `HH:MM` | 取消本次倒數 |
+| 模式 | 平台 | 設定方式 | 關閉主視窗後 |
+| --- | --- | --- | --- |
+| 單次倒數 | Windows、macOS、Linux | 1–10,080 分鐘，或下一個本機 `HH:MM` | 取消本次倒數 |
+| 每週排程 | Windows | 多選星期與 `HH:MM`，可快速選取每天或平日 | 仍會啟動獨立通知，倒數到期後執行 |
 
 - 每週預設為每天 `23:30`、模擬模式，按下「儲存並啟用排程」後才生效。
 - 模擬排程會實際註冊 Windows 任務並顯示通知，到期只保存結果，不呼叫關機。
@@ -18,15 +18,16 @@ A small Windows desktop shutdown timer with weekly schedules, advance reminders,
 - 單次指定時刻已過或等於目前分鐘時，排到明天。
 - 單次啟動至少需預留 30 秒；指定時刻太近時，會要求重新設定。
 
-### 0.2：關機前通知
+### 關機前通知
 
-最後五分鐘會出現獨立通知視窗，顯示倒數、預定時間與模擬／真實模式。單次倒數不足五分鐘時，通知會立即出現。
+進入最後五分鐘時，獨立倒數視窗會置頂，顯示預定時間與模擬／真實模式。單次倒數在五分鐘內時會立即顯示。Windows 同時送出系統通知，橫幅顯示依 Windows 通知與「勿擾」設定而定。macOS 和 Linux 使用應用程式的倒數視窗。Linux 的原生 Wayland 由桌面環境控制視窗層級，置頂與自動還原可能無法使用。
 
 | 通知操作 | 結果 |
 | --- | --- |
 | 延後 10／30 分鐘 | 累加至目前預定時間；若已到期但尚未執行，則從現在起算 |
 | 連續延後 | 每次繼續累加，剩餘時間最多 7 天 |
 | 延後後 | 保持通知可見，降為普通視窗；再次剩五分鐘時重新置頂提示 |
+| 縮小通知視窗 | 倒數會繼續。還原後仍可延後或取消 |
 | 取消本次關機 | 停止這次倒數，每週固定規則不變 |
 | 關閉通知視窗 | 等同取消本次關機 |
 
@@ -38,15 +39,17 @@ A small Windows desktop shutdown timer with weekly schedules, advance reminders,
 
 ## 執行
 
-需求：Windows 10／11、Rust 1.88 以上，以及 Rust Windows 工具鏈需要的 C++ 建置工具。專案使用 Rust 2024 edition。
+已通過建置的版本可從 [GitHub Actions](https://github.com/ntustRay/rust-auto-shutdown/actions/workflows/ci.yml) 對應執行紀錄的 Artifacts 下載。選擇平台與架構，Windows 解壓後執行 `r-auto-shutdown.exe`。macOS 和 Linux 的下載檔須再解開內含的 `.tar.gz`，在桌面工作階段開啟終端機並執行 `./r-auto-shutdown`。
 
-```powershell
+從原始碼執行需要 Rust 1.88 以上。Windows MSVC 工具鏈另需 C++ 建置工具。Linux 需安裝 `fontconfig` 和繁體中文字型，例如 Ubuntu 的 `fonts-noto-cjk`。Linux 的建置套件請參考官方文件。[eframe 建置說明](https://github.com/emilk/egui/blob/0.33.3/crates/eframe/README.md)
+
+```sh
 cargo run --release
 ```
 
-建置後可直接執行 `target\release\rust-auto-shutdown.exe`。
+建置結果位於 `target/release`。新版改用 `r-auto-shutdown` 檔名，原有 Windows 下載檔或桌面捷徑可改指向新版。既有 Windows 每週設定仍沿用原資料目錄與任務名稱。
 
-### 每週排程
+### Windows 每週排程
 
 1. 在「每週排程」選擇至少一個星期，輸入 24 小時制時間，例如 `23:30`。
 2. 先保留模擬模式，按下「儲存並啟用排程」。確認畫面顯示已生效設定。
@@ -58,24 +61,24 @@ cargo run --release
 
 每週排程在關機前五分鐘啟動通知。例如星期一 `00:02` 的關機排程，會在星期日 `23:57` 通知。如果在最後五分鐘才儲存，程式會立即開啟本次通知。如果剩餘時間不足 30 秒，本次會順延，保留至少 30 秒供你操作。固定的每週時間仍以設定為準，本次實際倒數與延後時間請看通知視窗。
 
-從 0.1 更新時，請至少開啟一次新版主程式。程式會嘗試將舊任務更新為提前五分鐘通知，保留原星期、時間與模式。若更新失敗，畫面會提示原任務可能仍直接關機；請停用後重新儲存。
+從 0.1 或 0.2 更新時，請至少開啟一次新版主程式。程式會嘗試更新背景執行檔與通知方式，保留原星期、時間與模式。若提示更新失敗，請關閉現有提醒後重新儲存排程。
 
 ### 單次倒數
 
-切換至「單次倒數」，設定分鐘數或指定時刻後啟動。到期前可取消，關閉視窗也會取消。每週排程與單次倒數互相獨立；取消其中一種不會停用另一種。
+開啟「單次倒數」，設定分鐘數或指定時刻後啟動。可先用 **10 分鐘模擬倒數**驗證，剩五分鐘時會出現提醒，縮小視窗後仍會走到模擬完成。關閉主視窗或提醒視窗會取消單次倒數。Windows 的單次倒數與每週排程各自運作。
 
 ### 命令列參數
 
 | 參數 | 用途 |
 | --- | --- |
-| 無參數 | 開啟視窗，載入已儲存的每週設定 |
+| 無參數 | 開啟主視窗；Windows 載入已儲存的每週設定 |
 | `--dry-run` | 相容啟動旗標；開啟同一視窗，不覆寫已儲存設定或停用既有任務 |
 | `--help`、`-h` | 顯示說明並結束 |
 | `--version`、`-V` | 顯示版本並結束 |
 
 排程由視窗設定，未知參數或不支援的參數組合以結束碼 `2` 結束。內部 `--scheduled-dry-run`／`--scheduled-shutdown` 入口供工作排程器啟動通知，不是命令列設定排程或直接關機功能。
 
-## 本機保存與停用
+## Windows 排程的本機保存與停用
 
 每週排程以目前 Windows 使用者的身分執行，不要求或保存 Windows 密碼，也不安裝背景服務。任務使用 `InteractiveToken` 與 `LeastPrivilege`；一般使用者可建立自身任務，但系統政策或權限仍可能拒絕建立。[Microsoft 任務安全性文件](https://learn.microsoft.com/en-us/windows/win32/taskschd/security-contexts-for-running-tasks)
 
@@ -100,21 +103,21 @@ cargo run --release
 
 - 每週排程需要目前使用者已登入、電腦保持清醒。任務設定為不喚醒電腦（`WakeToRun=false`），不補跑錯過的觸發（`StartWhenAvailable=false`）。
 - 單次倒數需保持程式開啟；跨睡眠或休眠的倒數行為不保證。
-- 真實模式呼叫 `shutdown.exe /s /t 0`，不使用 `/f` 強制結束應用程式。未儲存的文件或其他應用程式可能阻擋關機；請先儲存工作。[Microsoft `shutdown` 文件](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/shutdown)
+- Windows 呼叫 `shutdown.exe /s /t 0`，讓應用程式有機會阻擋關機。請先儲存工作。[Microsoft `shutdown` 文件](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/shutdown)
+- macOS 透過 `osascript` 向 System Events 送出關機要求，需要已登入的圖形桌面。macOS 可能在第一次送出要求時請你核准自動化權限，可在「系統設定 → 隱私權與安全性 → 自動化」查看。[Apple 自動化權限說明](https://support.apple.com/zh-tw/guide/mac-help/mchl07817563/mac)
+- Linux 透過 `busctl` 呼叫 systemd-logind 的 `PowerOff(false)`，需要可用的 logind 與當前使用者的關機權限。系統政策、其他登入工作階段或關機抑制鎖可拒絕要求。[systemd-logind D-Bus API](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html)
 - 一般 Windows 任務須在原通知點後兩分鐘內啟動。儲存時的即時提醒會另外核對本次的星期、時間與模式。兩種入口共用當次執行紀錄，避免同一個週期重複通知。
-- Windows 接受關機要求不代表已完成關機；執行紀錄描述的是要求結果。
-- 每週排程與真正關機僅支援 Windows。Linux 可用於編譯與單元測試。
-- 自動化測試不註冊真正關機任務，也不執行真正關機；通過測試不代表已完成實機關機驗證。
+- 執行紀錄描述系統是否接受關機要求。跨平台 CI 只執行測試與建置，實機關機需在各平台的桌面工作階段驗證。
 
 ## 開發與驗證
 
 主要套件為 `eframe 0.33.3`（Glow、AccessKit）、`chrono 0.4` 與 Serde。
 
-```powershell
+```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo build --release --locked
 ```
 
-GitHub Actions 在 Windows 執行格式、Clippy、單元測試、release 建置與命令列輸出檢查。成功後可從該次 workflow 的 artifact 下載執行檔，不自動建立 GitHub Release。
+GitHub Actions 在 Windows x64、Linux x64、macOS Apple silicon 與 macOS Intel 執行格式、Clippy、單元測試、release 建置與命令列輸出檢查。

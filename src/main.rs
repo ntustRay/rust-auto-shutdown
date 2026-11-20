@@ -5,6 +5,8 @@ mod notification;
 use eframe::egui;
 use rust_auto_shutdown::schedule;
 
+const APP_NAME: &str = "R Auto Shutdown";
+
 fn console_output() {
     #[cfg(windows)]
     unsafe {
@@ -37,10 +39,10 @@ fn main() -> eframe::Result {
     if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h" | "--version" | "-V") {
         console_output();
         if matches!(args[0].as_str(), "--version" | "-V") {
-            println!("rust-auto-shutdown {}", env!("CARGO_PKG_VERSION"));
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         } else {
             println!(
-                "Rust Auto Shutdown\n\nUsage: rust-auto-shutdown [--dry-run] [--help] [--version]\n\nA Windows shutdown timer with weekly schedules. Simulation is on by default."
+                "{APP_NAME}\n\nUsage: r-auto-shutdown [--dry-run] [--help] [--version]\n\nDesktop shutdown timer for Windows, macOS, and Linux. Weekly scheduling is available on Windows. Simulation is on by default."
             );
         }
         return Ok(());
@@ -51,7 +53,7 @@ fn main() -> eframe::Result {
         std::process::exit(2);
     }
     eframe::run_native(
-        "自動關機 · Auto Shutdown",
+        APP_NAME,
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([840.0, 760.0])
