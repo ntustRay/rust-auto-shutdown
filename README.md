@@ -41,6 +41,8 @@ A desktop shutdown timer for Windows, macOS, and Linux, with advance reminders, 
 
 已通過建置的版本可從 [GitHub Actions](https://github.com/ntustRay/rust-auto-shutdown/actions/workflows/ci.yml) 對應執行紀錄的 Artifacts 下載。選擇平台與架構，Windows 解壓後執行 `r-auto-shutdown.exe`。macOS 和 Linux 的下載檔須再解開內含的 `.tar.gz`，在桌面工作階段開啟終端機並執行 `./r-auto-shutdown`。
 
+macOS 建置產物尚未經 Apple 公證。若 macOS 阻擋執行，可從原始碼建置。
+
 從原始碼執行需要 Rust 1.88 以上。Windows MSVC 工具鏈另需 C++ 建置工具。Linux 需安裝 `fontconfig` 和繁體中文字型，例如 Ubuntu 的 `fonts-noto-cjk`。Linux 的建置套件請參考官方文件。[eframe 建置說明](https://github.com/emilk/egui/blob/0.33.3/crates/eframe/README.md)
 
 ```sh

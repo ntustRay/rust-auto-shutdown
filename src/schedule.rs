@@ -158,7 +158,7 @@ pub fn save(schedule: &WeeklySchedule) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn update_executable_if_needed(source: &Path, target: &Path) -> Result<(), String> {
     let source_path = source
         .canonicalize()
