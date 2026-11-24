@@ -245,6 +245,7 @@ pub fn builder(urgent: bool) -> egui::ViewportBuilder {
         .with_inner_size([560.0, 530.0])
         .with_min_inner_size([560.0, 530.0])
         .with_resizable(false)
+        .with_close_button(false)
         .with_minimize_button(true)
         .with_active(false)
         .with_window_level(if urgent {
@@ -273,7 +274,7 @@ pub fn draw(
     feedback: &str,
 ) -> Option<Action> {
     if ctx.input(|i| i.viewport().close_requested()) {
-        return Some(Action::Cancel);
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }
     let mut action = None;
     egui::CentralPanel::default()
@@ -369,7 +370,7 @@ pub fn draw(
             }
             ui.label(
                 RichText::new(
-                    "延後會累加到目前預定時間。\n最小化後會繼續倒數，關閉視窗會取消本次。",
+                    "延後會累加到目前預定時間。\n最小化後會繼續倒數。請按「取消本次關機」停止倒數。",
                 )
                 .size(14.0)
                 .color(MUTED),
@@ -427,6 +428,21 @@ struct WeeklyNotification {
     immediate: bool,
 }
 
+impl WeeklyNotification {
+    fn show_terminal(&mut self, ctx: &egui::Context, notice: TerminalNotice) {
+        self.terminal = Some(notice);
+        ctx.send_viewport_cmd(egui::ViewportCommand::EnableButtons {
+            close: true,
+            minimized: true,
+            maximize: false,
+        });
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal,
+        ));
+        ctx.request_repaint();
+    }
+}
+
 impl eframe::App for WeeklyNotification {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(notice) = &self.terminal {
@@ -460,8 +476,7 @@ impl eframe::App for WeeklyNotification {
                             Err(record_error) => format!("{error}\n紀錄也未能保存：{record_error}"),
                         };
                         self.session = None;
-                        self.terminal = Some(TerminalNotice::new("本次已取消", error));
-                        ctx.request_repaint();
+                        self.show_terminal(ctx, TerminalNotice::new("本次已取消", error));
                         return;
                     }
                 }
@@ -493,12 +508,10 @@ impl eframe::App for WeeklyNotification {
                 match result {
                     Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     Err(error) => {
-                        self.terminal = Some(TerminalNotice::new("本次已取消，紀錄未保存", error));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                            egui::WindowLevel::Normal,
-                        ));
-                        ctx.request_repaint();
+                        self.show_terminal(
+                            ctx,
+                            TerminalNotice::new("本次已取消，紀錄未保存", error),
+                        );
                     }
                 }
                 return;
@@ -534,10 +547,7 @@ impl eframe::App for WeeklyNotification {
                 }
                 Err(error) => format!("通知未能及時顯示，已取消本次；紀錄未保存：{error}"),
             };
-            self.terminal = Some(TerminalNotice::new("本次已取消", message));
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                egui::WindowLevel::Normal,
-            ));
+            self.show_terminal(ctx, TerminalNotice::new("本次已取消", message));
             return;
         }
         if let Some(result) = self.timer.poll(Instant::now(), shutdown::execute) {
@@ -560,10 +570,7 @@ impl eframe::App for WeeklyNotification {
             };
             self.session = None;
             if let Some(error) = error {
-                self.terminal = Some(TerminalNotice::new(title, error));
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                    egui::WindowLevel::Normal,
-                ));
+                self.show_terminal(ctx, TerminalNotice::new(title, error));
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -608,6 +615,30 @@ mod tests {
         assert!(!state.can_execute(now + Duration::from_secs(29)));
         state.mark_shown(now + Duration::from_secs(20));
         assert!(state.can_execute(now + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn window_close_requests_do_not_cancel_the_countdown() {
+        let viewport = builder(true);
+        assert_eq!(viewport.close_button, Some(false));
+        assert_eq!(viewport.minimize_button, Some(true));
+
+        let ctx = egui::Context::default();
+        let mut input = input(1.0, 0, Vec::new());
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let output = ctx.run(input, |ctx| {
+            assert!(draw(ctx, REMINDER_LEAD, Local::now(), true, "").is_none());
+        });
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
     }
 
     #[test]

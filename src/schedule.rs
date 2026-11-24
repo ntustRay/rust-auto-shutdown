@@ -169,7 +169,7 @@ fn update_executable_if_needed(source: &Path, target: &Path) -> Result<(), Strin
     std::fs::copy(source, target)
         .map(|_bytes| ())
         .map_err(|error| {
-            format!("無法更新排程執行檔：{error}。請先取消或關閉目前通知，再重新保存排程。")
+            format!("無法更新排程執行檔：{error}。請先取消本次關機或等倒數完成，再開啟新版。")
         })
 }
 
@@ -820,7 +820,7 @@ mod tests {
         update_executable_if_needed(&scratch.0, &target).unwrap();
         std::fs::write(&scratch.0, b"binary-v2").unwrap();
         let error = update_executable_if_needed(&scratch.0, &target).unwrap_err();
-        assert!(error.contains("請先取消或關閉目前通知"));
+        assert!(error.contains("請先取消本次關機或等倒數完成"));
         assert_eq!(std::fs::read(&target).unwrap(), b"binary-v1");
         drop(locked);
         update_executable_if_needed(&scratch.0, &target).unwrap();

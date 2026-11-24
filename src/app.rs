@@ -581,7 +581,10 @@ impl ShutdownApp {
                 }
             }
         }
-        caption(ui, "關閉視窗會取消單次倒數。");
+        caption(
+            ui,
+            "提醒出現前關閉主視窗會取消倒數。提醒出現後請使用取消按鈕。",
+        );
     }
 
     fn preview(&mut self, ui: &mut egui::Ui) {
@@ -780,7 +783,7 @@ impl ShutdownApp {
         if let Some(notice) = &self.reminder_terminal {
             let close = ctx.show_viewport_immediate(
                 notification::viewport_id(),
-                notification::builder(false),
+                notification::builder(false).with_close_button(true),
                 |child, _| notification::draw_terminal(child, notice),
             );
             if close {
@@ -857,9 +860,13 @@ impl ShutdownApp {
 impl eframe::App for ShutdownApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.timer.cancel();
-            self.reminder_window.dismiss_system_notice();
-            return;
+            if self.reminder_window.opened && self.timer.is_running() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else {
+                self.timer.cancel();
+                self.reminder_window.dismiss_system_notice();
+                return;
+            }
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(28))
